@@ -17,7 +17,7 @@ st.set_page_config(page_title="Energy + BESS Optimizer", layout="wide")
 
 
 def main():
-    st.title("Energy Plant + BESS – Otimizador de Projeto")
+    st.title("Energy Plant + BESS – Otimizador de Projeto (LCOE)")
 
     # --- Estado de cenários em memória (para MVP) ---
     if "scenarios" not in st.session_state:
@@ -151,27 +151,25 @@ def main():
                 "Permitir carga pela rede?", value=True
             )
 
-        # ----- TARGETS FINANCEIROS -----
-        st.markdown("### Targets financeiros")
-        colT1, colT2 = st.columns(2)
-        with colT1:
-            roi_target = st.number_input(
-                "ROI alvo (%/ano) (opcional)", value=15.0, step=1.0
+        # ----- TARGET DE LCOE -----
+        st.markdown("### Target de LCOE")
+        colL1, colL2 = st.columns(2)
+        with colL1:
+            lcoe_base = st.number_input(
+                "LCOE base (EUR/MWh)",
+                min_value=0.0,
+                value=50.0,
+                step=1.0,
+                help="Custo de referência por MWh do projeto (sem BESS).",
             )
-        with colT2:
-            ebitda_target = st.number_input(
-                "EBITDA alvo (EUR/ano) (opcional)",
-                value=0.0,
-                step=100_000.0,
+        with colL2:
+            lcoe_margin_pct = st.number_input(
+                "Margem sobre LCOE base (%)",
+                min_value=0.0,
+                value=20.0,
+                step=1.0,
+                help="Margem máxima de aumento do LCOE devido ao BESS.",
             )
-
-        opt_mode = st.radio(
-            "Modo de otimização",
-            [
-                "Encontrar BESS mínimo que cumpre ROI alvo",
-                "Maximizar ROI/EBITDA (sem target obrigatório)",
-            ],
-        )
 
         run_button = st.button("Rodar otimização", type="primary")
 
@@ -195,11 +193,8 @@ def main():
                         "eta_charge": eta_charge / 100.0,
                         "eta_discharge": eta_discharge / 100.0,
                         "allow_grid_charging": allow_grid_charging,
-                        "roi_target": roi_target / 100.0,
-                        "ebitda_target": ebitda_target
-                        if ebitda_target > 0
-                        else None,
-                        "opt_mode": opt_mode,
+                        "lcoe_base": lcoe_base,
+                        "lcoe_margin_pct": lcoe_margin_pct,
                     }
 
                     opt_result = run_optimization(
@@ -237,21 +232,40 @@ def main():
                 st.markdown(f"### Cenário: **{current_name}**")
                 colR1, colR2, colR3 = st.columns(3)
                 colR1.metric(
-                    "Capacidade ótima (MWh)",
+                    "Capacidade ótima do BESS (MWh)",
                     f"{result['E_cap_opt_MWh']:.2f}",
                 )
                 colR2.metric(
-                    "Potência ótima (MW)", f"{result['P_cap_opt_MW']:.2f}"
+                    "Potência ótima do BESS (MW)",
+                    f"{result['P_cap_opt_MW']:.2f}",
                 )
                 colR3.metric(
                     "ROI (%)", f"{result['ROI_percent']:.2f}"
+                )
+
+                colR4, colR5 = st.columns(2)
+                colR4.metric(
+                    "LCOE alvo (EUR/MWh)",
+                    f"{result.get('LCOE_target_EUR_per_MWh', 0.0):.2f}",
+                )
+                colR5.metric(
+                    "LCOE obtido (EUR/MWh)",
+                    f"{result.get('LCOE_actual_EUR_per_MWh', 0.0):.2f}",
                 )
 
                 st.metric(
                     "EBITDA (EUR/ano)",
                     f"{result['EBITDA_annual_EUR']:.0f}",
                 )
-                st.metric("Status", result["status_text"])
+
+                st.markdown(
+                    f"**BESS é necessário?** {result.get('BESS_required_text', 'N/A')}"
+                )
+                st.caption(
+                    "Interpretamos 'necessário' como: o ótimo tem BESS com capacidade/potência diferente de zero."
+                )
+
+                st.metric("Status do solver", result["status_text"])
 
                 if "schedule" in result:
                     schedule_df = result["schedule"]
@@ -275,6 +289,13 @@ def main():
                         "E_cap_MWh": res["E_cap_opt_MWh"],
                         "P_cap_MW": res["P_cap_opt_MW"],
                         "ROI_%": res["ROI_percent"],
+                        "LCOE_target": res.get(
+                            "LCOE_target_EUR_per_MWh", 0.0
+                        ),
+                        "LCOE_obtido": res.get(
+                            "LCOE_actual_EUR_per_MWh", 0.0
+                        ),
+                        "BESS_necessário": res.get("BESS_required", False),
                         "EBITDA_EUR_ano": res["EBITDA_annual_EUR"],
                         "Status": res["status_text"],
                     }
