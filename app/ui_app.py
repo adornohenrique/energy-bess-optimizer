@@ -1,5 +1,14 @@
+import os
+import sys
+
 import streamlit as st
 import pandas as pd
+
+# Garante que a pasta raiz do projeto (onde está "core/") esteja no sys.path
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
 
 from core.optimization import run_optimization
 
