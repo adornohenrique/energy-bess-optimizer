@@ -36,7 +36,7 @@ def _build_df_with_generation(price_df, scenario, gen_df=None):
     if dt_hours <= 0:
         raise ValueError("Passo de tempo inválido (datetime).")
 
-    # Caso 1: o usuário passou um gen_df com gen_MWh
+    # Caso 1: o usuário passou um gen_df com gen_MWh -> usa direto
     if gen_df is not None and "gen_MWh" in gen_df.columns:
         g = gen_df.copy()
         g["datetime"] = pd.to_datetime(g["datetime"])
@@ -82,11 +82,19 @@ def _build_df_with_generation(price_df, scenario, gen_df=None):
 def run_optimization(gen_df, price_df, scenario):
     """
     Otimiza tamanho da bateria (E_cap, P_cap) e operação (charge/discharge),
-    calculando EBITDA e ROI.
+    com objetivo de MAXIMIZAR EBITDA ANUAL, sujeito à restrição de LCOE:
+
+        LCOE_total <= LCOE_base * (1 + margem%)
+
+    Onde:
+      LCOE_total = Cost_annual / E_annual
+      Cost_annual = CRF * (CAPEX_gen + CAPEX_bess)
+      E_annual = energia entregue no ano (MWh)
 
     Parâmetros em 'scenario':
       capex_gen           : CAPEX da usina de geração (EUR)
       plant_mwp           : capacidade instalada (MWp)
+      P_grid_max          : potência máxima de exportação (MW)
       c_E_capex           : CAPEX BESS (EUR/kWh)
       c_P_capex           : CAPEX BESS (EUR/kW)
       lifetime_years      : vida útil da bateria (anos)
@@ -94,8 +102,8 @@ def run_optimization(gen_df, price_df, scenario):
       eta_charge          : eficiência de carga (0–1)
       eta_discharge       : eficiência de descarga (0–1)
       allow_grid_charging : bool
-      roi_target          : ROI alvo (0–1)
-      opt_mode            : string do modo
+      lcoe_base           : LCOE de referência (EUR/MWh)
+      lcoe_margin_pct     : margem (%) sobre o LCOE base
     """
     if price_df is None:
         raise ValueError("price_df não pode ser None.")
@@ -103,7 +111,13 @@ def run_optimization(gen_df, price_df, scenario):
     df, dt_hours = _build_df_with_generation(price_df, scenario, gen_df)
     T = len(df)
 
-    # Parâmetros financeiros
+    # Fator para anualizar (se a série não for 1 ano)
+    hours_in_series = T * dt_hours
+    if hours_in_series <= 0:
+        raise ValueError("Série de preços com duração inválida.")
+    annual_factor = 8760.0 / hours_in_series
+
+    # ----- Parâmetros financeiros e operacionais -----
     capex_gen = float(scenario["capex_gen"])
     c_E_capex = float(scenario["c_E_capex"])  # EUR/kWh
     c_P_capex = float(scenario["c_P_capex"])  # EUR/kW
@@ -112,18 +126,18 @@ def run_optimization(gen_df, price_df, scenario):
     eta_c = float(scenario["eta_charge"])
     eta_d = float(scenario["eta_discharge"])
     allow_grid_charging = bool(scenario["allow_grid_charging"])
-    roi_target = float(scenario.get("roi_target", 0.0))  # 0.15 = 15%
-    opt_mode = scenario.get(
-        "opt_mode", "Maximizar ROI/EBITDA (sem target obrigatório)"
-    )
+    lcoe_base = float(scenario["lcoe_base"])
+    lcoe_margin_pct = float(scenario["lcoe_margin_pct"])
 
-    # Modelo: minimizar CAPEX_BESS (cumprindo ROI alvo) OU maximizar EBITDA
-    find_min_bess_for_roi = opt_mode.startswith("Encontrar")
+    # Target de LCOE
+    lcoe_target = lcoe_base * (1.0 + lcoe_margin_pct / 100.0)
 
-    prob = pulp.LpProblem(
-        "BESS_size_and_operation",
-        pulp.LpMinimize if find_min_bess_for_roi else pulp.LpMaximize,
-    )
+    P_grid_max = float(scenario.get("P_grid_max", 0.0))
+    if P_grid_max <= 0:
+        P_grid_max = 1e9  # Sem limite prático
+
+    # ----- Problema de otimização: maximizar EBITDA -----
+    prob = pulp.LpProblem("BESS_size_and_operation_LCOE", pulp.LpMaximize)
 
     # Variáveis globais (tamanho da bateria)
     E_cap = pulp.LpVariable("E_cap_MWh", lowBound=0)
@@ -137,22 +151,25 @@ def run_optimization(gen_df, price_df, scenario):
     sold_gen = pulp.LpVariable.dicts("sold_from_gen", range(T), lowBound=0)
     spill = pulp.LpVariable.dicts("spill", range(T), lowBound=0)
 
-    # Restrições
+    # ----- Restrições operacionais -----
     for t in range(T):
         g_t = df.loc[t, "gen_MWh"]
 
         # Balanço da geração
         prob += sold_gen[t] + ch_ren[t] + spill[t] == g_t, "gen_balance_%d" % t
 
-        # Limites de potência
+        # Limites de potência da bateria (MWh/intervalo)
         prob += ch_ren[t] + ch_grid[t] <= P_cap * dt_hours, "ch_power_%d" % t
         prob += dis[t] <= P_cap * dt_hours, "dis_power_%d" % t
+
+        # Limite de exportação para a rede (MW -> MWh no intervalo)
+        prob += sold_gen[t] + dis[t] <= P_grid_max * dt_hours, "grid_export_%d" % t
 
         # Proibir carga da rede, se configurado
         if not allow_grid_charging:
             prob += ch_grid[t] == 0, "no_grid_charge_%d" % t
 
-        # Capacidade de energia
+        # Capacidade de energia da bateria
         prob += soc[t] <= E_cap, "soc_cap_%d" % t
 
         # Dinâmica do SOC (cíclica)
@@ -162,36 +179,38 @@ def run_optimization(gen_df, price_df, scenario):
             == soc[prev] + eta_c * (ch_ren[t] + ch_grid[t]) - dis[t] / eta_d
         ), "soc_dyn_%d" % t
 
-    # Termos financeiros
+    # ----- Termos de receita / custo / energia -----
     revenue_terms = []
     grid_cost_terms = []
+    energy_terms = []
 
     for t in range(T):
         price_t = df.loc[t, "price_EUR_per_MWh"]
         revenue_terms.append(price_t * (sold_gen[t] + dis[t]))
         grid_cost_terms.append(price_t * ch_grid[t])
+        energy_terms.append(sold_gen[t] + dis[t])
 
-    revenue_expr = pulp.lpSum(revenue_terms)
-    grid_cost_expr = pulp.lpSum(grid_cost_terms)
+    # Anualização
+    revenue_expr = annual_factor * pulp.lpSum(revenue_terms)
+    grid_cost_expr = annual_factor * pulp.lpSum(grid_cost_terms)
+    energy_annual_expr = annual_factor * pulp.lpSum(energy_terms)
 
     # CAPEX BESS e custo anualizado
-    bess_capex_expr = (
-        c_E_capex * 1000.0 * E_cap + c_P_capex * 1000.0 * P_cap
-    )  # usa kWh/kW -> MWh/MW
+    bess_capex_expr = c_E_capex * 1000.0 * E_cap + c_P_capex * 1000.0 * P_cap
+    capex_total_expr = capex_gen + bess_capex_expr
+    cost_annual_expr = crf(discount_rate, lifetime_years) * capex_total_expr
     bess_annual_cost_expr = crf(discount_rate, lifetime_years) * bess_capex_expr
 
+    # EBITDA anual (simplificado)
     ebitda_expr = revenue_expr - grid_cost_expr - bess_annual_cost_expr
-    capex_total_expr = capex_gen + bess_capex_expr
 
-    # Restrição de ROI, se modo alvo
-    if find_min_bess_for_roi and roi_target > 0:
-        prob += ebitda_expr >= roi_target * capex_total_expr, "roi_target_constraint"
+    # ----- Restrição de LCOE -----
+    # LCOE_total = Cost_annual / E_annual <= LCOE_target
+    # => Cost_annual <= LCOE_target * E_annual
+    prob += cost_annual_expr <= lcoe_target * energy_annual_expr, "lcoe_constraint"
 
-    # Objetivo
-    if find_min_bess_for_roi and roi_target > 0:
-        prob += bess_capex_expr
-    else:
-        prob += ebitda_expr
+    # ----- Objetivo: maximizar EBITDA anual -----
+    prob += ebitda_expr
 
     # Resolver
     prob.solve(pulp.PULP_CBC_CMD(msg=False))
@@ -204,10 +223,14 @@ def run_optimization(gen_df, price_df, scenario):
             "P_cap_opt_MW": 0.0,
             "ROI_percent": 0.0,
             "EBITDA_annual_EUR": 0.0,
+            "LCOE_target_EUR_per_MWh": lcoe_target,
+            "LCOE_actual_EUR_per_MWh": None,
+            "BESS_required": False,
+            "BESS_required_text": "Indeterminado (problema sem solução ótima)",
             "schedule": df,
         }
 
-    # Extrair valores
+    # ----- Extrair valores escalares -----
     E_cap_opt = E_cap.value()
     P_cap_opt = P_cap.value()
     bess_capex_val = bess_capex_eur(
@@ -216,6 +239,7 @@ def run_optimization(gen_df, price_df, scenario):
     bess_annual_cost_val = annualized_bess_cost_eur(
         bess_capex_val, discount_rate, lifetime_years
     )
+
     revenue_val = pulp.value(revenue_expr)
     grid_cost_val = pulp.value(grid_cost_expr)
     ebitda_val = ebitda_annual_eur(
@@ -223,6 +247,20 @@ def run_optimization(gen_df, price_df, scenario):
     )
     capex_total_val = capex_gen + bess_capex_val
     roi_val = roi_from_ebitda(ebitda_val, capex_total_val)
+
+    energy_annual_val = pulp.value(energy_annual_expr)
+    cost_annual_val = pulp.value(cost_annual_expr)
+    if energy_annual_val > 0:
+        lcoe_actual = cost_annual_val / energy_annual_val
+    else:
+        lcoe_actual = None
+
+    # BESS é necessário?
+    bess_required = (E_cap_opt > 1e-6) or (P_cap_opt > 1e-6)
+    if bess_required:
+        bess_required_text = "Sim, BESS diferente de zero é ótimo."
+    else:
+        bess_required_text = "Não: a planta atende o target de LCOE sem BESS."
 
     # Montar schedule
     sched = df.copy()
@@ -234,7 +272,7 @@ def run_optimization(gen_df, price_df, scenario):
     sched["spill_MWh"] = [spill[t].value() for t in range(T)]
 
     result = {
-        "status_text": "Solução ótima encontrada (modo: %s)" % opt_mode,
+        "status_text": "Solução ótima encontrada com restrição de LCOE",
         "E_cap_opt_MWh": E_cap_opt,
         "P_cap_opt_MW": P_cap_opt,
         "EBITDA_annual_EUR": ebitda_val,
@@ -243,6 +281,10 @@ def run_optimization(gen_df, price_df, scenario):
         "BESS_annual_cost_EUR": bess_annual_cost_val,
         "Revenue_EUR": revenue_val,
         "Grid_energy_cost_EUR": grid_cost_val,
+        "LCOE_target_EUR_per_MWh": lcoe_target,
+        "LCOE_actual_EUR_per_MWh": lcoe_actual,
+        "BESS_required": bess_required,
+        "BESS_required_text": bess_required_text,
         "schedule": sched,
     }
     return result
