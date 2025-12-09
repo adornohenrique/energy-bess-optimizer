@@ -62,9 +62,19 @@ def main():
         col1, col2 = st.columns(2)
 
         with col1:
-            st.markdown("### Usina de geração")
-            capex_gen = st.number_input("CAPEX da planta de geração (EUR)", min_value=0.0, value=10_000_000.0, step=100_000.0)
-            gen_file = st.file_uploader("Perfil de geração (CSV)", type=["csv"], key="gen_file")
+    st.markdown("### Usina de geração")
+    capex_gen = st.number_input(
+        "CAPEX da planta de geração (EUR)",
+        min_value=0.0,
+        value=10_000_000.0,
+        step=100_000.0,
+    )
+    plant_mwp = st.number_input(
+        "Capacidade instalada da planta (MWp)",
+        min_value=0.0,
+        value=100.0,
+        step=1.0,
+    )
 
         with col2:
             st.markdown("### Preços de energia")
@@ -100,44 +110,45 @@ def main():
 
         run_button = st.button("Rodar otimização", type="primary")
 
-        if run_button:
-            if gen_file is None or (price_source == "Arquivo CSV" and price_file is None):
-                st.error("Por favor, envie os arquivos de geração e preços.")
-            else:
-                with st.spinner("Rodando modelo de otimização..."):
-                    # Lê arquivos em DataFrames
-                    gen_df = pd.read_csv(gen_file)
-                    price_df = pd.read_csv(price_file) if price_file is not None else None
+       if run_button:
+    if price_source == "Arquivo CSV" and price_file is None:
+        st.error("Por favor, envie o arquivo de preços.")
+    else:
+        with st.spinner("Rodando modelo de otimização..."):
+            # Lê arquivo de preços
+            price_df = pd.read_csv(price_file) if price_file is not None else None
 
-                    # Monta config do cenário (simplificado)
-                    scenario_cfg = {
-                        "capex_gen": capex_gen,
-                        "c_E_capex": c_E_capex,
-                        "c_P_capex": c_P_capex,
-                        "lifetime_years": lifetime_years,
-                        "discount_rate": discount_rate,
-                        "eta_charge": eta_charge / 100.0,
-                        "eta_discharge": eta_discharge / 100.0,
-                        "allow_grid_charging": allow_grid_charging,
-                        "roi_target": roi_target / 100.0,
-                        "ebitda_target": ebitda_target if ebitda_target > 0 else None,
-                        "opt_mode": opt_mode,
-                    }
+            # Monta config do cenário (simplificado)
+            scenario_cfg = {
+                "capex_gen": capex_gen,
+                "plant_mwp": plant_mwp,
+                "c_E_capex": c_E_capex,
+                "c_P_capex": c_P_capex,
+                "lifetime_years": lifetime_years,
+                "discount_rate": discount_rate,
+                "eta_charge": eta_charge / 100.0,
+                "eta_discharge": eta_discharge / 100.0,
+                "allow_grid_charging": allow_grid_charging,
+                "roi_target": roi_target / 100.0,
+                "ebitda_target": ebitda_target if ebitda_target > 0 else None,
+                "opt_mode": opt_mode,
+            }
 
-                    opt_result = run_optimization(
-                        gen_df=gen_df,
-                        price_df=price_df,
-                        scenario=scenario_cfg,
-                    )
+            # Agora o run_optimization gera a curva de geração
+            opt_result = run_optimization(
+                gen_df=None,
+                price_df=price_df,
+                scenario=scenario_cfg,
+            )
 
-                    if st.session_state.current_scenario_name is None:
-                        st.session_state.current_scenario_name = new_name
-                    st.session_state.scenarios[st.session_state.current_scenario_name] = {
-                        "config": scenario_cfg,
-                        "result": opt_result,
-                    }
+            if st.session_state.current_scenario_name is None:
+                st.session_state.current_scenario_name = new_name
+            st.session_state.scenarios[st.session_state.current_scenario_name] = {
+                "config": scenario_cfg,
+                "result": opt_result,
+            }
 
-                    st.success("Otimização concluída! Veja a aba 'Resultados'.")
+            st.success("Otimização concluída! Veja a aba 'Resultados'.")
 
     with tab_results:
         st.subheader("Resultados do cenário atual")
