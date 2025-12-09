@@ -91,6 +91,13 @@ def main():
                 value=100.0,
                 step=1.0,
             )
+            P_grid_max = st.number_input(
+                "Potência máxima de exportação à rede (MW)",
+                min_value=0.0,
+                value=100.0,
+                step=1.0,
+                help="Limite de conexão com a rede. Se 0, considera sem limite prático.",
+            )
 
         # ----- PREÇOS DE ENERGIA -----
         with col2:
@@ -105,6 +112,7 @@ def main():
                     "Preços spot (CSV)",
                     type=["csv"],
                     key="price_file",
+                    help="Esperado: colunas 'datetime' e 'price_EUR_per_MWh'.",
                 )
 
         # ----- PARÂMETROS DO BESS -----
@@ -119,7 +127,7 @@ def main():
             )
         with colB2:
             lifetime_years = st.number_input(
-                "Vida útil (anos)", min_value=1, value=15, step=1
+                "Vida útil da bateria (anos)", min_value=1, value=15, step=1
             )
             discount_rate = st.number_input(
                 "Taxa de desconto (%)", min_value=0.0, value=8.0, step=0.5
@@ -179,6 +187,7 @@ def main():
                     scenario_cfg = {
                         "capex_gen": capex_gen,
                         "plant_mwp": plant_mwp,
+                        "P_grid_max": P_grid_max,
                         "c_E_capex": c_E_capex,
                         "c_P_capex": c_P_capex,
                         "lifetime_years": lifetime_years,
