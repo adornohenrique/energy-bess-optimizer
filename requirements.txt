@@ -4,3 +4,5 @@ numpy>=1.24
 matplotlib>=3.7
 pulp>=2.7
 reportlab>=4.0
+entsoe-py>=0.6.11
+pytz>=2024.1
