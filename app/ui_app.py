@@ -13,6 +13,20 @@ from reportlab.lib.units import cm
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
+# ---------- Formatação PT/BR ----------
+def fmt_pt(x, decimals=0):
+    """Formata número com . para milhar e , para decimais."""
+    if x is None:
+        return "-"
+    try:
+        s = f"{float(x):,.{decimals}f}"
+        return s.replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        return str(x)
+
+def euro(x, decimals=0):
+    return f"€ {fmt_pt(x, decimals)}"
+
 # Tornar o pacote raiz visível (para Streamlit Cloud)
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
@@ -41,9 +55,9 @@ with st.expander("ℹ️ **Ajuda & Legenda** (clique para expandir)"):
 2. Preencha **parâmetros econômicos** (CAPEX, vida útil, taxa, OPEX, disponibilidade).
 3. Defina **limites de conexão** (export/import) e **eficiências do BESS**.
 4. Informe **CAPEX BESS** (EUR/kWh, EUR/kW) e parâmetros de **degradação** (€/MWh_throughput, ciclos/ano).
-5. Veja **Baseline** e **Com BESS (MILP)**. O MILP alterna carga/descarga com **Big-M** (sem produto de variáveis).
+5. Veja **Baseline** e **Com BESS (MILP)**. O MILP alterna carga/descarga com **Big-M**.
 6. Opcional: **Sensibilidades** (±10/±20%) e **múltiplos cenários** (P50/P90...).
-7. Exporte **PDF** único com todos os cenários.
+7. Exporte **PDF** com um ou com **todos** os cenários.
 
 **Abreviações:**  
 - **LCOE**: Levelized Cost of Energy (EUR/MWh)  
@@ -124,17 +138,18 @@ with colC:
     P_grid_import_max = st.number_input("Import máx (MW)", min_value=0.0, value=100.0, step=1.0)
     allow_grid_charging = st.checkbox("Permitir carga pela rede?", value=True)
 
+# --------- BESS (ÚNICA SEÇÃO) ---------
 st.subheader("BESS – custos, eficiência e degradação")
 colE, colF, colG = st.columns(3)
 with colE:
-    c_E_capex = st.number_input("CAPEX BESS (EUR/kWh)", min_value=0.0, value=250.0, step=10.0)
-    c_P_capex = st.number_input("CAPEX BESS (EUR/kW)", min_value=0.0, value=150.0, step=10.0)
+    c_E_capex = st.number_input("CAPEX BESS (EUR/kWh)", min_value=0.0, value=250.0, step=10.0, key="cE")
+    c_P_capex = st.number_input("CAPEX BESS (EUR/kW)", min_value=0.0, value=150.0, step=10.0, key="cP")
 with colF:
-    eta_charge = st.number_input("Eficiência de carga (%)", min_value=0.0, max_value=100.0, value=95.0, step=1.0)
-    eta_discharge = st.number_input("Eficiência de descarga (%)", min_value=0.0, max_value=100.0, value=95.0, step=1.0)
+    eta_charge = st.number_input("Eficiência de carga (%)", min_value=0.0, max_value=100.0, value=95.0, step=1.0, key="etac")
+    eta_discharge = st.number_input("Eficiência de descarga (%)", min_value=0.0, max_value=100.0, value=95.0, step=1.0, key="etad")
 with colG:
-    deg_cost = st.number_input("Custo de degradação (EUR/MWh throughput)", min_value=0.0, value=2.0, step=0.5)
-    cycles_max = st.number_input("Limite de ciclos/ano (0 = sem limite)", min_value=0, value=300, step=10)
+    deg_cost = st.number_input("Custo de degradação (EUR/MWh throughput)", min_value=0.0, value=2.0, step=0.5, key="deg")
+    cycles_max = st.number_input("Limite de ciclos/ano (0 = sem limite)", min_value=0, value=300, step=10, key="cycles")
 
 run_sens = st.checkbox("Rodar sensibilidades (±10/±20% em c_E e c_P)?", value=True)
 
@@ -198,7 +213,7 @@ def _plot_schedule(df, title="Schedule – energia (MWh por passo)"):
     return fig
 
 # ---------------------------------------------------------
-# PDFs
+# PDFs (com números formatados PT/BR)
 # ---------------------------------------------------------
 def _build_pdf_single(baseline, with_bess, fig_compare, fig_sched, project_name="Projeto", scenario_name="Cenário"):
     buf = io.BytesIO()
@@ -217,15 +232,15 @@ def _build_pdf_single(baseline, with_bess, fig_compare, fig_sched, project_name=
     y -= 0.6*cm
     c.setFont("Helvetica", 11)
     lines = [
-        f"LCOE base: {baseline['LCOE_base_EUR_per_MWh']:.2f} EUR/MWh",
-        f"Receita base: {baseline['Revenue_annual_EUR']:.0f} EUR/ano",
+        f"LCOE base: {euro(baseline['LCOE_base_EUR_per_MWh'], 2)} /MWh",
+        f"Receita base: {euro(baseline['Revenue_annual_EUR'], 0)}/ano",
     ]
     if with_bess and with_bess.get("status_text", "").startswith("Solução"):
         lines += [
-            f"LCOE com BESS: {with_bess['LCOE_with_BESS_EUR_per_MWh']:.2f} EUR/MWh",
-            f"EBITDA com BESS: {with_bess['EBITDA_annual_EUR']:.0f} EUR/ano",
-            f"BESS ótimo: {with_bess['E_cap_opt_MWh']:.2f} MWh / {with_bess['P_cap_opt_MW']:.2f} MW",
-            f"Throughput anual: {with_bess['Throughput_annual_MWh']:.0f} MWh/ano",
+            f"LCOE com BESS: {euro(with_bess['LCOE_with_BESS_EUR_per_MWh'], 2)} /MWh",
+            f"EBITDA com BESS: {euro(with_bess['EBITDA_annual_EUR'], 0)}/ano",
+            f"BESS ótimo: {fmt_pt(with_bess['E_cap_opt_MWh'], 2)} MWh / {fmt_pt(with_bess['P_cap_opt_MW'], 2)} MW",
+            f"Throughput anual: {fmt_pt(with_bess['Throughput_annual_MWh'], 0)} MWh/ano",
         ]
     for line in lines:
         c.drawString(2.3*cm, y, line)
@@ -276,7 +291,6 @@ def _build_pdf_multi(results, compare_table, project_name="Energy+BESS – Batch
     headers = ["Cenário", "E_cap (MWh)", "P_cap (MW)", "EBITDA (EUR/ano)",
                "LCOE base", "LCOE BESS", "Receita base", "Receita BESS", "Throughput (MWh/ano)"]
     col_x = [2*cm, 6.2*cm, 8.2*cm, 10.2*cm, 13.2*cm, 15.2*cm, 2*cm, 6.2*cm, 10.2*cm]
-    # Cabeçalho (duas linhas para caber)
     c.drawString(col_x[0], y, headers[0])
     c.drawString(col_x[1], y, headers[1])
     c.drawString(col_x[2], y, headers[2])
@@ -289,7 +303,6 @@ def _build_pdf_multi(results, compare_table, project_name="Energy+BESS – Batch
     c.line(2*cm, y, width-2*cm, y); y -= 0.35*cm
     c.setFont("Helvetica", 9)
 
-    import math
     for _, row in compare_table.iterrows():
         if y < 2.5*cm:
             c.showPage()
@@ -299,16 +312,16 @@ def _build_pdf_multi(results, compare_table, project_name="Energy+BESS – Batch
             c.setFont("Helvetica", 9)
         # linha 1
         c.drawString(col_x[0], y, str(row["Cenário"]))
-        c.drawRightString(col_x[1]+1.6*cm, y, f"{row['E_cap_MWh']:.2f}" if pd.notna(row["E_cap_MWh"]) else "-")
-        c.drawRightString(col_x[2]+1.6*cm, y, f"{row['P_cap_MW']:.2f}" if pd.notna(row["P_cap_MW"]) else "-")
-        c.drawRightString(col_x[3]+3.2*cm, y, f"{row['EBITDA_EUR_ano']:,.0f}" if pd.notna(row["EBITDA_EUR_ano"]) else "-")
+        c.drawRightString(col_x[1]+1.6*cm, y, fmt_pt(row["E_cap_MWh"], 2) if pd.notna(row["E_cap_MWh"]) else "-")
+        c.drawRightString(col_x[2]+1.6*cm, y, fmt_pt(row["P_cap_MW"], 2) if pd.notna(row["P_cap_MW"]) else "-")
+        c.drawRightString(col_x[3]+3.2*cm, y, euro(row["EBITDA_EUR_ano"], 0) if pd.notna(row["EBITDA_EUR_ano"]) else "-")
         y -= 0.45*cm
         # linha 2
-        c.drawRightString(col_x[4]+1.6*cm, y, f"{row['LCOE_base']:.2f}" if pd.notna(row["LCOE_base"]) else "-")
-        c.drawRightString(col_x[5]+1.6*cm, y, f"{row['LCOE_com_BESS']:.2f}" if pd.notna(row["LCOE_com_BESS"]) else "-")
-        c.drawRightString(col_x[6]+3.0*cm, y, f"{row['Receita_base_EUR_ano']:,.0f}" if pd.notna(row["Receita_base_EUR_ano"]) else "-")
-        c.drawRightString(col_x[7]+3.0*cm, y, f"{row['Receita_BESS_EUR_ano']:,.0f}" if pd.notna(row["Receita_BESS_EUR_ano"]) else "-")
-        c.drawRightString(col_x[8]+3.2*cm, y, f"{row['Throughput_MWh_ano']:,.0f}" if pd.notna(row["Throughput_MWh_ano"]) else "-")
+        c.drawRightString(col_x[4]+1.6*cm, y, fmt_pt(row["LCOE_base"], 2) if pd.notna(row["LCOE_base"]) else "-")
+        c.drawRightString(col_x[5]+1.6*cm, y, fmt_pt(row["LCOE_com_BESS"], 2) if pd.notna(row["LCOE_com_BESS"]) else "-")
+        c.drawRightString(col_x[6]+3.0*cm, y, euro(row["Receita_base_EUR_ano"], 0) if pd.notna(row["Receita_base_EUR_ano"]) else "-")
+        c.drawRightString(col_x[7]+3.0*cm, y, euro(row["Receita_BESS_EUR_ano"], 0) if pd.notna(row["Receita_BESS_EUR_ano"]) else "-")
+        c.drawRightString(col_x[8]+3.2*cm, y, fmt_pt(row["Throughput_MWh_ano"], 0) if pd.notna(row["Throughput_MWh_ano"]) else "-")
         y -= 0.55*cm
 
     c.showPage()
@@ -325,15 +338,15 @@ def _build_pdf_multi(results, compare_table, project_name="Energy+BESS – Batch
 
         y = height - 3.5*cm
         lines = [
-            f"LCOE base: {base['LCOE_base_EUR_per_MWh']:.2f} EUR/MWh",
-            f"Receita base: {base['Revenue_annual_EUR']:.0f} EUR/ano",
+            f"LCOE base: {euro(base['LCOE_base_EUR_per_MWh'], 2)} /MWh",
+            f"Receita base: {euro(base['Revenue_annual_EUR'], 0)}/ano",
         ]
         if w and w.get("status_text", "").startswith("Solução"):
             lines += [
-                f"LCOE com BESS: {w['LCOE_with_BESS_EUR_per_MWh']:.2f} EUR/MWh",
-                f"EBITDA com BESS: {w['EBITDA_annual_EUR']:.0f} EUR/ano",
-                f"BESS ótimo: {w['E_cap_opt_MWh']:.2f} MWh / {w['P_cap_opt_MW']:.2f} MW",
-                f"Throughput anual: {w['Throughput_annual_MWh']:.0f} MWh/ano",
+                f"LCOE com BESS: {euro(w['LCOE_with_BESS_EUR_per_MWh'], 2)} /MWh",
+                f"EBITDA com BESS: {euro(w['EBITDA_annual_EUR'], 0)}/ano",
+                f"BESS ótimo: {fmt_pt(w['E_cap_opt_MWh'], 2)} MWh / {fmt_pt(w['P_cap_opt_MW'], 2)} MW",
+                f"Throughput anual: {fmt_pt(w['Throughput_annual_MWh'], 0)} MWh/ano",
             ]
         for line in lines:
             c.drawString(2*cm, y, line)
@@ -375,32 +388,53 @@ if mode == "Cenário único":
     st.header("Resultados – Baseline (sem BESS)")
     baseline = run_baseline(price_df, gen_df, params_common)
     c1, c2, c3 = st.columns(3)
-    c1.metric("Energia anual (MWh/ano)", f"{baseline['E_annual_MWh']:.0f}")
-    c2.metric("Receita anual (EUR/ano)", f"{baseline['Revenue_annual_EUR']:.0f}")
-    c3.metric("LCOE base (EUR/MWh)", f"{baseline['LCOE_base_EUR_per_MWh']:.2f}")
-    st.dataframe(baseline["schedule_baseline"].head(200))
+    c1.metric("Energia anual (MWh/ano)", fmt_pt(baseline['E_annual_MWh'], 0))
+    c2.metric("Receita anual (EUR/ano)", euro(baseline['Revenue_annual_EUR'], 0))
+    c3.metric("LCOE base (EUR/MWh)", euro(baseline['LCOE_base_EUR_per_MWh'], 2))
+
+    st.dataframe(
+        baseline["schedule_baseline"].head(200).style.format({
+            "gen_MWh":           lambda v: fmt_pt(v, 3),
+            "sold_direct_MWh":   lambda v: fmt_pt(v, 3),
+            "spill_MWh":         lambda v: fmt_pt(v, 3),
+            "price_EUR_per_MWh": lambda v: fmt_pt(v, 2),
+        })
+    )
 
     st.header("Resultados – Com BESS (MILP, arbitragem ótima)")
     res_bess = run_with_bess(price_df, gen_df, params_common)
     if res_bess.get("status_text", "").startswith("Solução"):
         c1, c2, c3 = st.columns(3)
-        c1.metric("E_cap ótima (MWh)", f"{res_bess['E_cap_opt_MWh']:.2f}")
-        c2.metric("P_cap ótima (MW)", f"{res_bess['P_cap_opt_MW']:.2f}")
-        c3.metric("Energia vendida (MWh/ano)", f"{res_bess['Energy_annual_MWh']:.0f}")
+        c1.metric("E_cap ótima (MWh)", fmt_pt(res_bess['E_cap_opt_MWh'], 2))
+        c2.metric("P_cap ótima (MW)", fmt_pt(res_bess['P_cap_opt_MW'], 2))
+        c3.metric("Energia vendida (MWh/ano)", fmt_pt(res_bess['Energy_annual_MWh'], 0))
 
         c4, c5, c6 = st.columns(3)
-        c4.metric("Receita (EUR/ano)", f"{res_bess['Revenue_annual_EUR']:.0f}")
-        c5.metric("Custo energia rede (EUR/ano)", f"{res_bess['Grid_energy_cost_annual_EUR']:.0f}")
-        c6.metric("EBITDA (EUR/ano)", f"{res_bess['EBITDA_annual_EUR']:.0f}")
+        c4.metric("Receita (EUR/ano)", euro(res_bess['Revenue_annual_EUR'], 0))
+        c5.metric("Custo energia rede (EUR/ano)", euro(res_bess['Grid_energy_cost_annual_EUR'], 0))
+        c6.metric("EBITDA (EUR/ano)", euro(res_bess['EBITDA_annual_EUR'], 0))
 
         c7, c8, c9 = st.columns(3)
-        c7.metric("CAPEX BESS (EUR)", f"{res_bess['BESS_CAPEX_EUR']:.0f}")
-        c8.metric("LCOE com BESS (EUR/MWh)", f"{res_bess['LCOE_with_BESS_EUR_per_MWh']:.2f}")
-        c9.metric("Throughput (MWh/ano)", f"{res_bess['Throughput_annual_MWh']:.0f}")
+        c7.metric("CAPEX BESS (EUR)", euro(res_bess['BESS_CAPEX_EUR'], 0))
+        c8.metric("LCOE com BESS (EUR/MWh)", euro(res_bess['LCOE_with_BESS_EUR_per_MWh'], 2))
+        c9.metric("Throughput (MWh/ano)", fmt_pt(res_bess['Throughput_annual_MWh'], 0))
 
         st.subheader("Gráficos")
         fig_compare = _plot_compare_baseline_bess(baseline, res_bess)
         fig_sched = _plot_schedule(res_bess["schedule"], "Schedule – Com BESS")
+
+        st.dataframe(
+            res_bess["schedule"].head(200).style.format({
+                "gen_MWh":                 lambda v: fmt_pt(v, 3),
+                "sold_from_gen_MWh":       lambda v: fmt_pt(v, 3),
+                "spill_MWh":               lambda v: fmt_pt(v, 3),
+                "charge_from_ren_MWh":     lambda v: fmt_pt(v, 3),
+                "charge_from_grid_MWh":    lambda v: fmt_pt(v, 3),
+                "discharge_MWh":           lambda v: fmt_pt(v, 3),
+                "soc_MWh":                 lambda v: fmt_pt(v, 3),
+                "price_EUR_per_MWh":       lambda v: fmt_pt(v, 2),
+            })
+        )
     else:
         st.warning(res_bess.get("status_text", "Falha ao otimizar com BESS."))
         fig_compare, fig_sched = None, None
@@ -409,7 +443,16 @@ if mode == "Cenário único":
     if res_bess.get("status_text", "").startswith("Solução") and run_sens and st.checkbox("Mostrar sensibilidades (tabela)", value=True):
         st.header("Sensibilidades – c_E e c_P (±10/±20%)")
         sens_df = run_sensitivities(price_df, gen_df, params_common)
-        st.dataframe(sens_df)
+        st.dataframe(
+            sens_df.style.format({
+                "delta_cE_%":           lambda v: fmt_pt(v, 0),
+                "delta_cP_%":           lambda v: fmt_pt(v, 0),
+                "E_cap_MWh":            lambda v: fmt_pt(v, 2),
+                "P_cap_MW":             lambda v: fmt_pt(v, 2),
+                "EBITDA_annual_EUR":    lambda v: euro(v, 0),
+                "LCOE_with_BESS":       lambda v: fmt_pt(v, 2),
+            })
+        )
 
     # Exportar PDF do cenário único
     st.header("Exportar PDF")
@@ -434,7 +477,19 @@ if mode == "Cenário único":
 else:
     st.header("Resultados – Vários cenários (P50/P90, etc.)")
     results, compare_table = run_batch_scenarios(price_df_list, gen_df_list, labels, params_common)
-    st.dataframe(compare_table)
+
+    st.dataframe(
+        compare_table.style.format({
+            "E_cap_MWh":             lambda v: "-" if pd.isna(v) else fmt_pt(v, 2),
+            "P_cap_MW":              lambda v: "-" if pd.isna(v) else fmt_pt(v, 2),
+            "EBITDA_EUR_ano":        lambda v: "-" if pd.isna(v) else euro(v, 0),
+            "LCOE_base":             lambda v: "-" if pd.isna(v) else fmt_pt(v, 2),
+            "LCOE_com_BESS":         lambda v: "-" if pd.isna(v) else fmt_pt(v, 2),
+            "Receita_base_EUR_ano":  lambda v: "-" if pd.isna(v) else euro(v, 0),
+            "Receita_BESS_EUR_ano":  lambda v: "-" if pd.isna(v) else euro(v, 0),
+            "Throughput_MWh_ano":    lambda v: "-" if pd.isna(v) else fmt_pt(v, 0),
+        })
+    )
 
     if len(compare_table) > 0:
         fig, ax = plt.subplots()
