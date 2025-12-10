@@ -1,15 +1,14 @@
 # core/optimization.py
+from __future__ import annotations
 from typing import Optional
 import numpy as np
 import pandas as pd
 import pulp
-
 from core.finance import annualized_cost, lcoe_annual, bess_capex_eur
 
 
-# ----------------------- utilitários -----------------------
 def _infer_dt_hours(dt_series: pd.Series) -> float:
-    s = pd.to_datetime(dt_series)
+    s = pd.to_datetime(dt_series, utc=True)
     if len(s) < 2:
         raise ValueError("Série temporal curta.")
     dt_h = (s.iloc[1] - s.iloc[0]).total_seconds() / 3600.0
@@ -27,42 +26,39 @@ def _merge_all(price_df: pd.DataFrame,
                pv_df: Optional[pd.DataFrame],
                load_df: Optional[pd.DataFrame]) -> pd.DataFrame:
     if "datetime" not in price_df or "price_EUR_per_MWh" not in price_df:
-        raise ValueError("Preços: use colunas 'datetime, price_EUR_per_MWh'.")
-
+        raise ValueError("Preços: 'datetime, price_EUR_per_MWh'.")
     df = price_df.copy()
-    df["datetime"] = pd.to_datetime(df["datetime"])
+    df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
     df = df.sort_values("datetime").reset_index(drop=True)
-
     if pv_df is not None:
         pv = pv_df.copy()
         if "datetime" not in pv or "pv_MW" not in pv:
-            raise ValueError("PV: use colunas 'datetime, pv_MW'.")
-        pv["datetime"] = pd.to_datetime(pv["datetime"])
+            raise ValueError("PV: 'datetime, pv_MW'.")
+        pv["datetime"] = pd.to_datetime(pv["datetime"], utc=True)
         pv = pv.sort_values("datetime").reset_index(drop=True)
         df = pd.merge_asof(df, pv, on="datetime")
     else:
         df["pv_MW"] = 0.0
-
     if load_df is not None:
         ld = load_df.copy()
         if "datetime" not in ld or "load_MW" not in ld:
-            raise ValueError("Carga: use colunas 'datetime, load_MW'.")
-        ld["datetime"] = pd.to_datetime(ld["datetime"])
+            raise ValueError("Carga: 'datetime, load_MW'.")
+        ld["datetime"] = pd.to_datetime(ld["datetime"], utc=True)
         ld = ld.sort_values("datetime").reset_index(drop=True)
         df = pd.merge_asof(df, ld, on="datetime")
     else:
         df["load_MW"] = 0.0
-
     df[["pv_MW", "load_MW"]] = df[["pv_MW", "load_MW"]].fillna(0.0)
     return df
 
 
-# ----------------------- baselines -------------------------
 def baselines_mw(price_df: pd.DataFrame,
                  pv_df: Optional[pd.DataFrame] = None,
                  load_df: Optional[pd.DataFrame] = None,
-                 import_fee: float = 0.0,
-                 export_fee: float = 0.0) -> dict:
+                 import_fee_const: float = 0.0,
+                 export_fee_const: float = 0.0,
+                 import_fee_series: Optional[np.ndarray] = None,
+                 export_fee_series: Optional[np.ndarray] = None) -> dict:
     df = _merge_all(price_df, pv_df, load_df)
     dt = _infer_dt_hours(df["datetime"])
     af = _annual_factor(len(df), dt)
@@ -71,18 +67,26 @@ def baselines_mw(price_df: pd.DataFrame,
     pv_MWh = df["pv_MW"].to_numpy(float) * dt
     load_MWh = df["load_MW"].to_numpy(float) * dt
 
-    cost_consumption_series = ((price + float(import_fee)) * load_MWh).sum()
-    revenue_solar_only_series = ((price - float(export_fee)) * pv_MWh).sum()
+    if import_fee_series is not None and len(import_fee_series) == len(df):
+        imp_fee = np.asarray(import_fee_series, dtype=float)
+    else:
+        imp_fee = np.full(len(df), float(import_fee_const))
+    if export_fee_series is not None and len(export_fee_series) == len(df):
+        exp_fee = np.asarray(export_fee_series, dtype=float)
+    else:
+        exp_fee = np.full(len(df), float(export_fee_const))
+
+    cost_consumption_series = np.sum((price + imp_fee) * load_MWh)
+    revenue_solar_only_series = np.sum((price - exp_fee) * pv_MWh)
 
     return {
         "dt_hours": dt,
         "annual_factor": af,
-        "Cost_consumption_annual_EUR": af * cost_consumption_series,
-        "Revenue_solar_only_annual_EUR": af * revenue_solar_only_series,
+        "Cost_consumption_annual_EUR": af * float(cost_consumption_series),
+        "Revenue_solar_only_annual_EUR": af * float(revenue_solar_only_series),
     }
 
 
-# ------------------------- MILP ----------------------------
 def run_site_bess_mw(price_df: pd.DataFrame,
                      pv_df: Optional[pd.DataFrame],
                      load_df: Optional[pd.DataFrame],
@@ -100,24 +104,47 @@ def run_site_bess_mw(price_df: pd.DataFrame,
     pv_MWh = df["pv_MW"].to_numpy(float) * dt
     load_MWh = df["load_MW"].to_numpy(float) * dt
 
-    # parâmetros BESS
+    # séries de tarifas (por passo)
+    if params.get("import_fee_series") is not None and len(params["import_fee_series"]) == T:
+        imp_fee = np.asarray(params["import_fee_series"], dtype=float)
+    else:
+        imp_fee = np.full(T, float(params.get("import_fee_eur_per_MWh", 0.0)))
+    if params.get("export_fee_series") is not None and len(params["export_fee_series"]) == T:
+        exp_fee = np.asarray(params["export_fee_series"], dtype=float)
+    else:
+        exp_fee = np.full(T, float(params.get("export_fee_eur_per_MWh", 0.0)))
+
+    # BESS
     P_cap = float(P_bess_MW)
     c_rate = max(1e-6, float(c_rate_per_hour))
     E_cap = P_cap / c_rate
-    eta_c = float(params.get("eta_charge", 0.95))
-    eta_d = float(params.get("eta_discharge", 0.95))
-    soc_min = float(params.get("soc_min", 0.0)) * E_cap
-    soc_max = float(params.get("soc_max", 1.0)) * E_cap
 
-    # rede e tarifas
-    import_fee = float(params.get("import_fee_eur_per_MWh", 0.0))
-    export_fee = float(params.get("export_fee_eur_per_MWh", 0.0))
+    # Eficiências: η_charge_total = η_charge * η_AC→DC ; η_discharge_total = η_discharge * η_DC→AC
+    eta_c  = float(params.get("eta_charge", 0.95))
+    eta_d  = float(params.get("eta_discharge", 0.95))
+    eta_ac2dc = float(params.get("eta_ac2dc", 1.0))
+    eta_dc2ac = float(params.get("eta_dc2ac", 1.0))
+    eta_charge_total    = eta_c  * eta_ac2dc
+    eta_discharge_total = eta_d  * eta_dc2ac
+
+    soc_min_frac = float(params.get("soc_min", 0.0))
+    soc_max_frac = float(params.get("soc_max", 1.0))
+    soc_init_frac = float(params.get("soc_init", 0.5))
+    soc_final_min_frac = float(params.get("soc_final_min", 0.0))
+    enforce_equal_terminal = bool(params.get("enforce_terminal_equals_init", False))
+
+    soc_min = soc_min_frac * E_cap
+    soc_max = soc_max_frac * E_cap
+    soc_init = soc_init_frac * E_cap
+    soc_final_min = soc_final_min_frac * E_cap
+
+    # Rede e solver
     allow_grid_charging = bool(params.get("allow_grid_charging", True))
     imp_cap = float(params.get("P_grid_import_max", 1e12)) * dt
     exp_cap = float(params.get("P_grid_export_max", 1e12)) * dt
     M_step = max(1e-6, P_cap * dt)
 
-    # custos
+    # Custos
     deg_cost = float(params.get("deg_cost_eur_per_MWh_throughput", 0.0))
     opex_fix_bess = float(params.get("opex_fix_bess", 0.0))
     opex_fix_gen  = float(params.get("opex_fix_gen", 0.0))
@@ -130,7 +157,7 @@ def run_site_bess_mw(price_df: pd.DataFrame,
     c_P = float(params.get("c_P_capex", 150.0))
     capex_gen = float(params.get("capex_gen", 0.0))
 
-    # modelo
+    # Modelo
     prob = pulp.LpProblem("BESS_MW", pulp.LpMaximize)
 
     c_grid  = pulp.LpVariable.dicts("c_grid",  range(T), lowBound=0)  # carga via rede
@@ -143,35 +170,44 @@ def run_site_bess_mw(price_df: pd.DataFrame,
     soc     = pulp.LpVariable.dicts("soc",     range(T), lowBound=soc_min, upBound=soc_max)
     y       = pulp.LpVariable.dicts("y_chg",   range(T), lowBound=0, upBound=1, cat=pulp.LpBinary)
 
+    # Inicial
+    prob += soc[0] == soc_init + eta_charge_total*(c_grid[0] + c_pv[0]) - (d_grid[0] + d_load[0])/eta_discharge_total, "soc_init_step"
+
     for t in range(T):
-        # balanços
+        # Balanços
         prob += pv_load[t] + c_pv[t] + pv_exp[t] == pv_MWh[t], f"pv_bal_{t}"
         prob += g_load[t] + pv_load[t] + d_load[t] == load_MWh[t], f"load_bal_{t}"
 
-        # potência (P*dt)
+        # Potência por passo (MWh no passo)
         prob += c_grid[t] + c_pv[t] <= M_step, f"lim_charge_{t}"
         prob += d_grid[t] + d_load[t] <= M_step, f"lim_discharge_{t}"
 
-        # exclusividade
+        # Exclusividade
         prob += c_grid[t] + c_pv[t] <= M_step * y[t],         f"switch_c_{t}"
         prob += d_grid[t] + d_load[t] <= M_step * (1 - y[t]), f"switch_d_{t}"
 
-        # limites de rede
-        prob += g_load[t] + c_grid[t] <= imp_cap,       f"imp_cap_{t}"
-        prob += pv_exp[t] + d_grid[t] <= exp_cap,       f"exp_cap_{t}"
+        # Limites de rede
+        prob += g_load[t] + c_grid[t] <= imp_cap, f"imp_cap_{t}"
+        prob += pv_exp[t] + d_grid[t] <= exp_cap, f"exp_cap_{t}"
         if not allow_grid_charging:
-            prob += c_grid[t] == 0,                     f"no_grid_charge_{t}"
+            prob += c_grid[t] == 0,               f"no_grid_charge_{t}"
 
-        # dinâmica SOC (cíclico)
-        prev = T - 1 if t == 0 else t - 1
-        prob += soc[t] == soc[prev] + eta_c*(c_grid[t] + c_pv[t]) - (d_grid[t] + d_load[t])/eta_d, f"soc_{t}"
+        # Dinâmica SOC (a partir do 2º passo)
+        if t >= 1:
+            prob += soc[t] == soc[t-1] + eta_charge_total*(c_grid[t] + c_pv[t]) - (d_grid[t] + d_load[t])/eta_discharge_total, f"soc_{t}"
 
-    # objetivo
-    revenue_export = pulp.lpSum([(price[t] - export_fee)*(pv_exp[t] + d_grid[t]) for t in range(T)])
-    savings_self   = pulp.lpSum([(price[t] + import_fee)*(pv_load[t] + d_load[t]) for t in range(T)])
-    cost_charge    = pulp.lpSum([(price[t] + import_fee)*c_grid[t] for t in range(T)])
+    # Terminal
+    if enforce_equal_terminal:
+        prob += soc[T-1] == soc_init, "terminal_equal_init"
+    else:
+        prob += soc[T-1] >= soc_final_min, "terminal_min"
+
+    # Objetivo
+    revenue_export = pulp.lpSum([(price[t] - exp_fee[t]) * (pv_exp[t] + d_grid[t]) for t in range(T)])
+    savings_self   = pulp.lpSum([(price[t] + imp_fee[t]) * (pv_load[t] + d_load[t]) for t in range(T)])
+    cost_charge    = pulp.lpSum([(price[t] + imp_fee[t]) * c_grid[t] for t in range(T)])
     throughput     = pulp.lpSum([d_grid[t] + d_load[t] for t in range(T)])
-    deg_cost_series = deg_cost * throughput
+    deg_cost_series = float(deg_cost) * throughput
 
     gross_margin_series = revenue_export + savings_self - cost_charge - deg_cost_series
     prob += gross_margin_series
@@ -186,42 +222,39 @@ def run_site_bess_mw(price_df: pd.DataFrame,
     thr_series      = val(throughput)
     margin_series   = val(gross_margin_series)
 
-    # anualização
-    revenue_annual = af * revenue_series
-    savings_annual = af * savings_series
-    charge_annual  = af * charge_series
-    thr_annual     = af * thr_series
-    margin_annual  = af * margin_series
+    revenue_annual = float(_annual_factor(T, dt) * revenue_series)
+    savings_annual = float(_annual_factor(T, dt) * savings_series)
+    charge_annual  = float(_annual_factor(T, dt) * charge_series)
+    thr_annual     = float(_annual_factor(T, dt) * thr_series)
+    margin_annual  = float(_annual_factor(T, dt) * margin_series)
 
-    # capex/opex
-    bess_capex = bess_capex_eur(E_cap, P_cap, c_E, c_P)
-    bess_ann   = annualized_cost(bess_capex, discount, lifetime)
+    bess_capex = bess_capex_eur(E_cap, P_cap, float(params.get("c_E_capex", 250.0)), float(params.get("c_P_capex", 150.0)))
+    bess_ann   = annualized_cost(bess_capex, float(params.get("discount_rate", 8.0)), int(params.get("lifetime_years", 15)))
 
-    # energia transacionada com rede para opex_var_trade
+    # energia transacionada com o mercado (para opex_var_trade)
     energy_market_series = val(pulp.lpSum([g_load[t] + c_grid[t] + pv_exp[t] + d_grid[t] for t in range(T)]))
-    energy_market_annual = af * energy_market_series
-    opex_var_trade_annual = opex_var_trade * energy_market_annual
+    energy_market_annual = float(_annual_factor(T, dt) * energy_market_series)
+    opex_var_trade_annual = float(params.get("opex_var_trade_eur_per_MWh", 0.0)) * energy_market_annual
 
     # energia PV (para opex_var_gen)
     energy_pv_series = val(pulp.lpSum([pv_load[t] + c_pv[t] + pv_exp[t] for t in range(T)]))
-    energy_pv_annual = af * energy_pv_series
-    opex_var_gen_annual = opex_var_gen * energy_pv_annual
+    energy_pv_annual = float(_annual_factor(T, dt) * energy_pv_series)
+    opex_var_gen_annual = float(params.get("opex_var_gen_eur_per_mwh", 0.0)) * energy_pv_annual
 
-    ebitda_annual = margin_annual - bess_ann - opex_fix_bess - opex_fix_gen - opex_var_trade_annual - opex_var_gen_annual
+    ebitda_annual = margin_annual - bess_ann - float(params.get("opex_fix_bess", 0.0)) - float(params.get("opex_fix_gen", 0.0)) - opex_var_trade_annual - opex_var_gen_annual
 
-    # LCOE total (referência)
-    energy_delivered_annual = af * val(pulp.lpSum([pv_load[t] + pv_exp[t] + d_grid[t] + d_load[t] for t in range(T)]))
-    lcoe_total = lcoe_annual(capex_total_eur=capex_gen + bess_capex,
-                             rate_percent=discount,
-                             n_years=lifetime,
+    energy_delivered_annual = float(_annual_factor(T, dt) * val(pulp.lpSum([pv_load[t] + pv_exp[t] + d_grid[t] + d_load[t] for t in range(T)])))
+    lcoe_total = lcoe_annual(capex_total_eur=float(params.get("capex_gen", 0.0)) + bess_capex,
+                             rate_percent=float(params.get("discount_rate", 8.0)),
+                             n_years=int(params.get("lifetime_years", 15)),
                              energy_annual_MWh=max(1e-9, energy_delivered_annual),
-                             opex_fix_eur_per_year=opex_fix_bess + opex_fix_gen,
-                             opex_var_eur_per_MWh=opex_var_trade + opex_var_gen)
+                             opex_fix_eur_per_year=float(params.get("opex_fix_bess", 0.0)) + float(params.get("opex_fix_gen", 0.0)),
+                             opex_var_eur_per_MWh=float(params.get("opex_var_trade_eur_per_MWh", 0.0)) + float(params.get("opex_var_gen_eur_per_mwh", 0.0)))
 
     result = {
         "status_text": status,
         "dt_hours": dt,
-        "annual_factor": af,
+        "annual_factor": _annual_factor(T, dt),
         "P_cap_MW": P_cap,
         "E_cap_MWh": E_cap,
         "Revenue_export_annual_EUR": revenue_annual,
@@ -243,6 +276,8 @@ def run_site_bess_mw(price_df: pd.DataFrame,
             "price_EUR_per_MWh": price,
             "pv_MWh": pv_MWh,
             "load_MWh": load_MWh,
+            "import_fee_EUR_per_MWh": imp_fee,
+            "export_fee_EUR_per_MWh": exp_fee,
             "c_grid_MWh": [pulp.value(c_grid[t]) for t in range(T)],
             "c_pv_MWh": [pulp.value(c_pv[t]) for t in range(T)],
             "d_grid_MWh": [pulp.value(d_grid[t]) for t in range(T)],
@@ -257,7 +292,6 @@ def run_site_bess_mw(price_df: pd.DataFrame,
     return result
 
 
-# ------------- varredura (P em MW, C-rate em 1/h) -------------
 def optimize_site_bess_mw(price_df: pd.DataFrame,
                            pv_df: Optional[pd.DataFrame],
                            load_df: Optional[pd.DataFrame],
