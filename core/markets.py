@@ -1,86 +1,81 @@
 # core/markets.py
 from __future__ import annotations
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 import pandas as pd
-import numpy as np
-
-# entsoe-py
 from entsoe import EntsoePandasClient, CountryCode
 
-
-# Países/zonas prontos para uso (pode ampliar esta lista quando quiser)
+# Lista para o seletor
 COUNTRY_CHOICES: list[tuple[str, str]] = [
-    ("Portugal", "PT"),
-    ("Spain", "ES"),
-    ("France", "FR"),
-    ("Germany (DE-LU)", "DE"),
-    ("Netherlands", "NL"),
-    ("Belgium", "BE"),
-    ("Italy", "IT"),
-    ("Poland", "PL"),
-    ("Austria", "AT"),
-    ("Czechia", "CZ"),
-    ("Hungary", "HU"),
-    ("Slovakia", "SK"),
-    ("Slovenia", "SI"),
-    ("Croatia", "HR"),
-    ("Greece", "GR"),
-    ("Finland", "FI"),
-    ("Sweden", "SE"),
-    ("Norway", "NO"),
-    ("Denmark", "DK"),
-    ("Lithuania", "LT"),
-    ("Latvia", "LV"),
-    ("Estonia", "EE"),
-    ("Ireland", "IE"),
+    ("Portugal", "PT"), ("Spain", "ES"), ("France", "FR"),
+    ("Germany (DE-LU)", "DE"), ("Netherlands", "NL"),
+    ("Belgium", "BE"), ("Italy", "IT"), ("Poland", "PL"),
+    ("Austria", "AT"), ("Czechia", "CZ"), ("Hungary", "HU"),
+    ("Slovakia", "SK"), ("Slovenia", "SI"), ("Croatia", "HR"),
+    ("Greece", "GR"), ("Finland", "FI"), ("Sweden", "SE"),
+    ("Norway", "NO"), ("Denmark", "DK"), ("Lithuania", "LT"),
+    ("Latvia", "LV"), ("Estonia", "EE"), ("Ireland", "IE"),
 ]
+
+# Presets (valores SUGERIDOS; ajuste conforme seu caso/DSO)
+# import/export em €/MWh e limites em MW
+COUNTRY_TARIFF_PRESETS: Dict[str, Dict[str, float]] = {
+    "PT": {"import_fee": 7.0, "export_fee": 1.0, "P_imp": 200.0, "P_exp": 200.0},
+    "ES": {"import_fee": 6.0, "export_fee": 1.0, "P_imp": 200.0, "P_exp": 200.0},
+    "FR": {"import_fee": 8.0, "export_fee": 1.5, "P_imp": 200.0, "P_exp": 200.0},
+    "DE": {"import_fee": 9.0, "export_fee": 2.0, "P_imp": 200.0, "P_exp": 200.0},
+    "NL": {"import_fee": 8.0, "export_fee": 1.0, "P_imp": 200.0, "P_exp": 200.0},
+    "BE": {"import_fee": 8.0, "export_fee": 1.0, "P_imp": 200.0, "P_exp": 200.0},
+    "IT": {"import_fee": 10.0, "export_fee": 2.0, "P_imp": 200.0, "P_exp": 200.0},
+    "PL": {"import_fee": 7.0, "export_fee": 1.0, "P_imp": 200.0, "P_exp": 200.0},
+    "AT": {"import_fee": 7.0, "export_fee": 1.0, "P_imp": 200.0, "P_exp": 200.0},
+    "CZ": {"import_fee": 7.0, "export_fee": 1.0, "P_imp": 200.0, "P_exp": 200.0},
+    "HU": {"import_fee": 7.0, "export_fee": 1.0, "P_imp": 200.0, "P_exp": 200.0},
+    "SK": {"import_fee": 7.0, "export_fee": 1.0, "P_imp": 200.0, "P_exp": 200.0},
+    "SI": {"import_fee": 7.0, "export_fee": 1.0, "P_imp": 200.0, "P_exp": 200.0},
+    "HR": {"import_fee": 7.0, "export_fee": 1.0, "P_imp": 200.0, "P_exp": 200.0},
+    "GR": {"import_fee": 8.0, "export_fee": 1.5, "P_imp": 200.0, "P_exp": 200.0},
+    "FI": {"import_fee": 6.0, "export_fee": 0.5, "P_imp": 200.0, "P_exp": 200.0},
+    "SE": {"import_fee": 6.0, "export_fee": 0.5, "P_imp": 200.0, "P_exp": 200.0},
+    "NO": {"import_fee": 5.0, "export_fee": 0.5, "P_imp": 200.0, "P_exp": 200.0},
+    "DK": {"import_fee": 7.0, "export_fee": 1.0, "P_imp": 200.0, "P_exp": 200.0},
+    "LT": {"import_fee": 7.0, "export_fee": 1.0, "P_imp": 200.0, "P_exp": 200.0},
+    "LV": {"import_fee": 7.0, "export_fee": 1.0, "P_imp": 200.0, "P_exp": 200.0},
+    "EE": {"import_fee": 7.0, "export_fee": 1.0, "P_imp": 200.0, "P_exp": 200.0},
+    "IE": {"import_fee": 8.0, "export_fee": 1.5, "P_imp": 200.0, "P_exp": 200.0},
+}
+
+def get_country_defaults(alpha2: str) -> Dict[str, float]:
+    return COUNTRY_TARIFF_PRESETS.get(alpha2, {"import_fee": 0.0, "export_fee": 0.0, "P_imp": 200.0, "P_exp": 200.0})
 
 def _to_utc_15s(df: pd.DataFrame, col_time="datetime", col_price="price_EUR_per_MWh") -> pd.DataFrame:
     out = df.copy()
     out[col_time] = pd.to_datetime(out[col_time], utc=True)
     out = out.set_index(col_time).sort_index()
-    # entsoe vem em 60 min — reamostra para 15 s com forward-fill
     out = out.resample("15S").ffill()
     out = out.reset_index()
     out.rename(columns={"index": "datetime"}, inplace=True)
     return out[[ "datetime", col_price ]]
 
-def fetch_entsoe_day_ahead_prices(country_alpha2: str,
-                                  start_date: str,
-                                  end_date: str,
-                                  token: str) -> pd.DataFrame:
-    """
-    Retorna DataFrame: datetime (UTC) + price_EUR_per_MWh, reamostrado em 15 s.
-    start_date, end_date no formato 'YYYY-MM-DD'.
-    """
+def fetch_entsoe_day_ahead_prices(country_alpha2: str, start_date: str, end_date: str, token: str) -> pd.DataFrame:
     if not token:
         raise ValueError("Informe o token ENTSO-E.")
     cc = getattr(CountryCode, country_alpha2)
     client = EntsoePandasClient(api_key=token)
-
-    # ENTSO-E exige timezone Europe/Brussels (recomendado)
     tz = "Europe/Brussels"
     start = pd.Timestamp(start_date, tz=tz)
-    end   = pd.Timestamp(end_date,   tz=tz) + pd.Timedelta(days=1)  # incluir o fim
-
-    # divide por janelas de até 90 dias para evitar timeouts
-    prices = []
+    end   = pd.Timestamp(end_date,   tz=tz) + pd.Timedelta(days=1)
+    chunks = []
     cur = start
     while cur < end:
         nxt = min(cur + pd.Timedelta(days=90), end)
-        s = client.query_day_ahead_prices(cc, cur, nxt)  # Series com tz
+        s = client.query_day_ahead_prices(cc, cur, nxt)
         if s is not None and len(s) > 0:
-            prices.append(s)
+            chunks.append(s)
         cur = nxt
-
-    if not prices:
-        raise RuntimeError("Sem dados retornados pela ENTSO-E para o período escolhido.")
-
-    series = pd.concat(prices).sort_index()
+    if not chunks:
+        raise RuntimeError("Sem dados ENTSO-E para o período.")
+    series = pd.concat(chunks).sort_index()
     series = series[~series.index.duplicated(keep="last")]
-
     df = series.to_frame("price_EUR_per_MWh").reset_index().rename(columns={"index":"datetime"})
-    # converte para UTC e reamostra 15s
     df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_convert("UTC")
-    df = _to_utc_15s(df, col_time="datetime", col_price="price_EUR_per_MWh")
-    return df
+    return _to_utc_15s(df, col_time="datetime", col_price="price_EUR_per_MWh")
