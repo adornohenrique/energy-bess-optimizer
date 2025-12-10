@@ -121,17 +121,18 @@ def run_baseline(price_df: pd.DataFrame,
     }
 
 # =========================================================
-# Otimização com BESS (MILP) – Big-M linearization
+# Otimização com BESS (MILP) – Big-M linearization + time limit
 # =========================================================
 def run_with_bess(price_df: pd.DataFrame,
                   gen_df: pd.DataFrame,
                   params: dict) -> dict:
     """
     Maximiza o EBITDA anual com MILP:
-      - Proíbe carga e descarga simultâneas via Big-M (sem produto de variáveis).
-      - Permite carga da rede (opcional) com limite de importação.
+      - Proíbe carga/descarga simultâneas via Big-M (sem produto de variáveis).
+      - Permite carga da rede (opcional) e limitações de import/export.
       - Degradação via custo por throughput (€/MWh_throughput).
-      - Limite de ciclos/ano: throughput_annual <= 2 * E_cap * cycles_per_year_max
+      - Limite de ciclos/ano.
+      - Solver com time-limit para não travar o app (default 180s).
     """
     # --- Preparação ---
     dt = _infer_dt_hours(gen_df["datetime"])
@@ -150,7 +151,7 @@ def run_with_bess(price_df: pd.DataFrame,
     exp_cap = (params.get("P_grid_export_max", 0.0) if params.get("P_grid_export_max", 0.0) > 0 else 1e12) * dt
     imp_cap = (params.get("P_grid_import_max", 0.0) if params.get("P_grid_import_max", 0.0) > 0 else 1e12) * dt
 
-    # Big-M (constante por passo) para alternância carga/descarga
+    # Big-M por passo para alternância carga/descarga
     g_max = float(df["gen_MWh"].max()) if T > 0 else 0.0
     M_step = max(exp_cap, imp_cap, g_max + imp_cap) + 1.0
 
@@ -160,6 +161,7 @@ def run_with_bess(price_df: pd.DataFrame,
     allow_grid = bool(params.get("allow_grid_charging", True))
     deg_cost = float(params.get("deg_cost_eur_per_MWh_throughput", 0.0))
     cycles_max = float(params.get("cycles_per_year_max", 0.0))  # 0 => sem limite
+    time_limit = int(params.get("solver_time_limit_s", 180))
 
     # Variáveis globais (dimensionamento)
     E_cap = pulp.LpVariable("E_cap_MWh", lowBound=0)
@@ -183,11 +185,9 @@ def run_with_bess(price_df: pd.DataFrame,
         # Balanço da geração
         prob += s_dir[t] + c_ren[t] + spill[t] == g_t, f"gen_balance_{t}"
 
-        # --- BIG-M linearization ---
-        # Limites de potência do BESS por passo (sem binária)
+        # Limites de potência e alternância (Big-M)
         prob += c_ren[t] + c_grid[t] <= P_cap * dt, f"charge_cap_{t}"
         prob += d[t] <= P_cap * dt, f"discharge_cap_{t}"
-        # Alternância carga/descarga com Big-M (sem produto de variáveis)
         prob += c_ren[t] + c_grid[t] <= M_step * y[t], f"charge_switch_{t}"
         prob += d[t] <= M_step * (1 - y[t]), f"discharge_switch_{t}"
 
@@ -211,13 +211,13 @@ def run_with_bess(price_df: pd.DataFrame,
     grid_cost_series = pulp.lpSum([price[t] * c_grid[t] for t in range(T)])
     energy_series = pulp.lpSum([s_dir[t] + d[t] for t in range(T)])
 
-    revenue_annual = _annual_factor(T, dt) * revenue_series
-    grid_cost_annual = _annual_factor(T, dt) * grid_cost_series
-    energy_annual = _annual_factor(T, dt) * energy_series
+    revenue_annual = af * revenue_series
+    grid_cost_annual = af * grid_cost_series
+    energy_annual = af * energy_series
 
     # Throughput anual aproximado (carga + descarga)
     throughput_series = pulp.lpSum([(c_ren[t] + c_grid[t]) + d[t] for t in range(T)])
-    throughput_annual = _annual_factor(T, dt) * throughput_series
+    throughput_annual = af * throughput_series
 
     # Limite de ciclos/ano
     if cycles_max > 0:
@@ -233,8 +233,7 @@ def run_with_bess(price_df: pd.DataFrame,
     opex_fix_bess = float(params.get("opex_fix_bess", 0.0))
 
     # Degradação (€/MWh_throughput)
-    deg_cost = float(params.get("deg_cost_eur_per_MWh_throughput", 0.0))
-    deg_cost_annual = deg_cost * throughput_annual
+    deg_cost_annual = float(params.get("deg_cost_eur_per_MWh_throughput", 0.0)) * throughput_annual
 
     # EBITDA anual
     ebitda_annual = revenue_annual - grid_cost_annual - bess_annual_cost - opex_fix_bess - opex_var_annual - deg_cost_annual
@@ -242,12 +241,18 @@ def run_with_bess(price_df: pd.DataFrame,
     # Objetivo
     prob += ebitda_annual
 
-    # Resolver
-    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    # Resolver (com time limit)
+    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit)
+    prob.solve(solver)
     status = pulp.LpStatus[prob.status]
+    if status not in ("Optimal", "Not Solved", "Undefined", "Infeasible", "Unbounded"):
+        status = "Undefined"
+
     if status != "Optimal":
+        # Retorna algo amigável; app ainda consegue gerar PDF com baseline
         return {
-            "status_text": f"Modelo não encontrou solução ótima (status: {status})",
+            "status_text": f"Solver terminou sem ótima (status: {status}). "
+                           f"Tente agregar a série (1h) ou aumentar o limite de tempo.",
             "schedule": df,
         }
 
@@ -256,13 +261,14 @@ def run_with_bess(price_df: pd.DataFrame,
     P_cap_opt = P_cap.value()
 
     df_out = df.copy()
-    df_out["soc_MWh"] = [soc[t].value() for t in range(T)]
-    df_out["charge_from_ren_MWh"] = [c_ren[t].value() for t in range(T)]
-    df_out["charge_from_grid_MWh"] = [c_grid[t].value() for t in range(T)]
-    df_out["discharge_MWh"] = [d[t].value() for t in range(T)]
-    df_out["sold_from_gen_MWh"] = [s_dir[t].value() for t in range(T)]
-    df_out["spill_MWh"] = [spill[t].value() for t in range(T)]
-    df_out["is_charging_mode"] = [y[t].value() for t in range(T)]
+    T_range = range(T)
+    df_out["soc_MWh"] = [soc[t].value() for t in T_range]
+    df_out["charge_from_ren_MWh"] = [c_ren[t].value() for t in T_range]
+    df_out["charge_from_grid_MWh"] = [c_grid[t].value() for t in T_range]
+    df_out["discharge_MWh"] = [d[t].value() for t in T_range]
+    df_out["sold_from_gen_MWh"] = [s_dir[t].value() for t in T_range]
+    df_out["spill_MWh"] = [spill[t].value() for t in T_range]
+    df_out["is_charging_mode"] = [y[t].value() for t in T_range]
 
     revenue_val = pulp.value(revenue_annual)
     grid_cost_val = pulp.value(grid_cost_annual)
@@ -301,7 +307,7 @@ def run_with_bess(price_df: pd.DataFrame,
     }
 
 # =========================================================
-# Sensibilidades (±10/±20%) em c_E e c_P
+# Sensibilidades e batch (inalterado)
 # =========================================================
 def run_sensitivities(price_df: pd.DataFrame,
                       gen_df: pd.DataFrame,
@@ -325,9 +331,7 @@ def run_sensitivities(price_df: pd.DataFrame,
                 })
     return pd.DataFrame(rows)
 
-# =========================================================
-# Lote de cenários (P50/P90 etc.)
-# =========================================================
+
 def run_batch_scenarios(price_dfs, gen_dfs, labels, params):
     results = []
     rows = []
