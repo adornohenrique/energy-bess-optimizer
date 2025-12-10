@@ -66,7 +66,7 @@ def _to_utc_15s(df: pd.DataFrame, col_time="datetime", col_price="price_EUR_per_
     out = df.copy()
     out[col_time] = pd.to_datetime(out[col_time], utc=True)
     out = out.set_index(col_time).sort_index()
-    out = out.resample("15S").ffill()
+    out = out.resample("15s").ffill()
     out = out.reset_index()
     out.rename(columns={"index": "datetime"}, inplace=True)
     return out[["datetime", col_price]]
