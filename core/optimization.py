@@ -121,24 +121,18 @@ def run_baseline(price_df: pd.DataFrame,
     }
 
 # =========================================================
-# Otimização com BESS (MILP) – Sprint 2
+# Otimização com BESS (MILP) – com linearização Big-M
 # =========================================================
 def run_with_bess(price_df: pd.DataFrame,
                   gen_df: pd.DataFrame,
                   params: dict) -> dict:
     """
     Maximiza o EBITDA anual com MILP:
-      - Proíbe carga e descarga simultâneas (binária y_t).
+      - Proíbe carga e descarga simultâneas usando Big-M (sem produto var×binária).
       - Permite carga da rede (opcional) com limite de importação.
       - Degradação via custo por throughput (€/MWh_throughput).
       - Limite de ciclos/ano: throughput_annual <= 2 * E_cap * cycles_per_year_max
     """
-    # Requer em params (além dos do baseline):
-    # c_E_capex, c_P_capex, eta_charge, eta_discharge, allow_grid_charging,
-    # P_grid_import_max,
-    # opex_fix_bess, opex_var_eur_per_mwh,
-    # deg_cost_eur_per_MWh_throughput, cycles_per_year_max
-
     # --- Preparação ---
     dt = _infer_dt_hours(gen_df["datetime"])
     af = _annual_factor(len(gen_df), dt)
@@ -155,6 +149,11 @@ def run_with_bess(price_df: pd.DataFrame,
     # Limites de rede (MWh/step)
     exp_cap = (params.get("P_grid_export_max", 0.0) if params.get("P_grid_export_max", 0.0) > 0 else 1e12) * dt
     imp_cap = (params.get("P_grid_import_max", 0.0) if params.get("P_grid_import_max", 0.0) > 0 else 1e12) * dt
+
+    # Big-M (constante por passo) para alternância carga/descarga
+    # usa o maior limite de energia possível no passo
+    g_max = float(df["gen_MWh"].max()) if T > 0 else 0.0
+    M_step = max(exp_cap, imp_cap, g_max + imp_cap) + 1.0  # margem
 
     # Parâmetros do BESS
     eta_c = float(params.get("eta_charge", 0.95))
@@ -185,9 +184,13 @@ def run_with_bess(price_df: pd.DataFrame,
         # Balanço da geração
         prob += s_dir[t] + c_ren[t] + spill[t] == g_t, f"gen_balance_{t}"
 
-        # Potências com binária (impede ch e dis simultâneos)
-        prob += c_ren[t] + c_grid[t] <= P_cap * dt * y[t], f"charge_power_{t}"
-        prob += d[t] <= P_cap * dt * (1 - y[t]), f"discharge_power_{t}"
+        # --- BIG-M linearization ---
+        # Limites de potência do BESS por passo (sem binária)
+        prob += c_ren[t] + c_grid[t] <= P_cap * dt, f"charge_cap_{t}"
+        prob += d[t] <= P_cap * dt, f"discharge_cap_{t}"
+        # Alternância carga/descarga com Big-M (sem produto de variáveis)
+        prob += c_ren[t] + c_grid[t] <= M_step * y[t], f"charge_switch_{t}"
+        prob += d[t] <= M_step * (1 - y[t]), f"discharge_switch_{t}"
 
         # Limites de rede
         prob += s_dir[t] + d[t] <= exp_cap, f"export_cap_{t}"
@@ -213,11 +216,11 @@ def run_with_bess(price_df: pd.DataFrame,
     grid_cost_annual = af * grid_cost_series
     energy_annual = af * energy_series
 
-    # Throughput anual aproximado = carga + descarga (em MWh) na série, anualizado
+    # Throughput anual aproximado = carga + descarga (MWh), anualizado
     throughput_series = pulp.lpSum([(c_ren[t] + c_grid[t]) + d[t] for t in range(T)])
     throughput_annual = af * throughput_series
 
-    # Limite de ciclos/ano: throughput_annual <= 2 * E_cap * cycles_max
+    # Limite de ciclos/ano
     if cycles_max > 0:
         prob += throughput_annual <= 2.0 * E_cap * cycles_max, "cycles_per_year_limit"
 
@@ -230,7 +233,8 @@ def run_with_bess(price_df: pd.DataFrame,
     opex_var_annual = opex_var * energy_annual
     opex_fix_bess = float(params.get("opex_fix_bess", 0.0))
 
-    # Degradação por throughput (€/MWh_throughput)
+    # Degradação (€/MWh_throughput)
+    deg_cost = float(params.get("deg_cost_eur_per_MWh_throughput", 0.0))
     deg_cost_annual = deg_cost * throughput_annual
 
     # EBITDA anual
@@ -271,7 +275,7 @@ def run_with_bess(price_df: pd.DataFrame,
     bess_annual_cost_val = annualized_cost(bess_capex_val, params["discount_rate"], int(params["lifetime_years"]))
     ebitda_val = pulp.value(ebitda_annual)
 
-    # LCOE com BESS (CAPEX_total = CAPEX_gen + CAPEX_bess)
+    # LCOE com BESS
     lcoe_with_bess = lcoe_annual(
         capex_total_eur=params["capex_gen"] + bess_capex_val,
         rate_percent=params["discount_rate"],
@@ -326,18 +330,12 @@ def run_sensitivities(price_df: pd.DataFrame,
 # Lote de cenários (P50/P90 etc.)
 # =========================================================
 def run_batch_scenarios(price_dfs, gen_dfs, labels, params):
-    """
-    price_dfs, gen_dfs: listas do mesmo tamanho com DataFrames.
-    labels: rótulos (ex.: ["P50", "P90"]).
-    Retorna lista de dicts (baseline/bess por cenário) + tabela comparativa.
-    """
     results = []
     rows = []
-    for i, (p, g, name) in enumerate(zip(price_dfs, gen_dfs, labels)):
+    for (p, g, name) in zip(price_dfs, gen_dfs, labels):
         base = run_baseline(p, g, params)
         withb = run_with_bess(p, g, params)
-        item = {"label": name, "baseline": base, "with_bess": withb}
-        results.append(item)
+        results.append({"label": name, "baseline": base, "with_bess": withb})
 
         if withb.get("status_text", "").startswith("Solução"):
             rows.append({
@@ -363,6 +361,4 @@ def run_batch_scenarios(price_dfs, gen_dfs, labels, params):
                 "Receita_BESS_EUR_ano": None,
                 "Throughput_MWh_ano": None,
             })
-
-    table = pd.DataFrame(rows)
-    return results, table
+    return results, pd.DataFrame(rows)
