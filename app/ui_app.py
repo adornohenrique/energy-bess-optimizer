@@ -26,53 +26,43 @@ from core.optimization import (
     run_batch_scenarios,
 )
 
-st.set_page_config(page_title="Energy + BESS Optimizer – Sprint 2", layout="wide")
+st.set_page_config(page_title="Energy + BESS Optimizer", layout="wide")
 
 # ---------------------------------------------------------
-# Ajuda & Legenda (passo a passo + abreviações)
+# Ajuda & Legenda
 # ---------------------------------------------------------
 with st.expander("ℹ️ **Ajuda & Legenda** (clique para expandir)"):
     st.markdown("""
-**Como rodar uma simulação (passo a passo):**
-1. Vá em **Dados de entrada** e **envie dois CSVs**:  
-   - **Preços**: `datetime, price_EUR_per_MWh`  
-   - **Geração**: `datetime, gen_MWh`  
-   O intervalo de tempo deve ser o mesmo (ex.: 15 min, 1 h).
-2. Preencha os **parâmetros econômicos** (CAPEX, vida útil, taxa, OPEX, disponibilidade).
-3. Preencha os **limites de conexão** (export/import) e as **eficiências do BESS**.
-4. Informe **custos** do BESS (EUR/kWh e EUR/kW) e **premissas de degradação** (€/MWh_throughput e ciclos/ano).
-5. Veja **Baseline (sem BESS)** e **Com BESS (MILP)**.  
-   O MILP **impede carga e descarga ao mesmo tempo** e escolhe automaticamente quando carregar/descargar para **maximizar o EBITDA anual**.
-6. Opcional: rode **sensibilidades** (±10/±20% em c_E e c_P) e/ou carregue **múltiplos cenários** (ex.: P50/P90).
-7. Exporte um **Excel** (na versão Sprint 1) e/ou um **PDF** com narrativa e gráficos.  
-   **Novo:** no modo múltiplos cenários, você pode **baixar um único PDF** com *todos* os cenários.
+**Como rodar:**
+1. Envie dois CSVs:  
+   • **Preços**: `datetime,price_EUR_per_MWh`  
+   • **Geração**: `datetime,gen_MWh`  
+   (mesmo passo temporal – ex.: 15 min)
+2. Preencha **parâmetros econômicos** (CAPEX, vida útil, taxa, OPEX, disponibilidade).
+3. Defina **limites de conexão** (export/import) e **eficiências do BESS**.
+4. Informe **CAPEX BESS** (EUR/kWh, EUR/kW) e parâmetros de **degradação** (€/MWh_throughput, ciclos/ano).
+5. Veja **Baseline** e **Com BESS (MILP)**. O MILP alterna carga/descarga com **Big-M** (sem produto de variáveis).
+6. Opcional: **Sensibilidades** (±10/±20%) e **múltiplos cenários** (P50/P90...).
+7. Exporte **PDF** único com todos os cenários.
 
-**Abreviações:**
+**Abreviações:**  
 - **LCOE**: Levelized Cost of Energy (EUR/MWh)  
 - **EBITDA**: Earnings Before Interest, Taxes, Depreciation and Amortization  
 - **BESS**: Battery Energy Storage System  
 - **E_cap (MWh)**: capacidade de energia da bateria  
 - **P_cap (MW)**: potência da bateria  
-- **Throughput (MWh/ano)**: energia processada (carga + descarga) ao longo do ano  
-- **CRF**: Capital Recovery Factor (fator para anualizar CAPEX)  
-- **OPEX**: Custos operacionais (fixos e/ou variáveis)  
-- **P50/P90**: cenários de probabilidade (mediana vs conservador)  
-- **Export/Import máx (MW)**: limites do ponto de conexão com a rede
-
-**Notas importantes de modelagem:**
-- O LCOE é calculado com **CAPEX anualizado (CRF)** + OPEX, dividido pela energia vendida no ano.  
-- O throughput anual é **aproximado** por (carga + descarga).  
-- O limite de ciclos usa: `throughput_annual ≤ 2 · E_cap · ciclos/ano`.  
-- A degradação é aproximada por um custo **linear** em €/MWh de throughput.
+- **Throughput (MWh/ano)**: carga + descarga no ano  
+- **CRF**: Capital Recovery Factor  
+- **P50/P90**: cenários de probabilidade
 """)
 
 # ---------------------------------------------------------
-# Modo de execução: único cenário ou múltiplos (P50/P90)
+# Modo de execução
 # ---------------------------------------------------------
 mode = st.radio("Modo de execução", ["Cenário único", "Múltiplos cenários (P50/P90, etc.)"])
 
 # ---------------------------------------------------------
-# Dados de entrada
+# Uploads
 # ---------------------------------------------------------
 st.header("Dados de entrada")
 
@@ -96,9 +86,11 @@ else:
     st.subheader("Upload de **múltiplos** CSVs")
     c1, c2 = st.columns(2)
     with c1:
-        price_files = st.file_uploader("CSV de preços (vários) – `datetime,price_EUR_per_MWh`", type=["csv"], key="price_multi", accept_multiple_files=True)
+        price_files = st.file_uploader("CSV de preços (vários) – `datetime,price_EUR_per_MWh`",
+                                       type=["csv"], key="price_multi", accept_multiple_files=True)
     with c2:
-        gen_files = st.file_uploader("CSV de geração (vários) – `datetime,gen_MWh`", type=["csv"], key="gen_multi", accept_multiple_files=True)
+        gen_files = st.file_uploader("CSV de geração (vários) – `datetime,gen_MWh`",
+                                     type=["csv"], key="gen_multi", accept_multiple_files=True)
 
     labels_raw = st.text_input("Rótulos (na ordem dos arquivos) – ex.: P50,P90", value="P50,P90")
     labels = [x.strip() for x in labels_raw.split(",") if x.strip()]
@@ -111,7 +103,7 @@ else:
     gen_df_list = [pd.read_csv(f) for f in gen_files]
 
 # ---------------------------------------------------------
-# Parâmetros econômicos / operacionais
+# Parâmetros
 # ---------------------------------------------------------
 st.header("Parâmetros econômicos e operacionais")
 colA, colB, colC = st.columns(3)
@@ -166,7 +158,7 @@ params_common = {
 }
 
 # ---------------------------------------------------------
-# Helpers de gráficos (sem exibir) para PDF múltiplo
+# Helpers de gráfico (também usados no PDF)
 # ---------------------------------------------------------
 def _make_compare_figure(baseline, with_bess):
     fig, ax = plt.subplots()
@@ -195,9 +187,6 @@ def _make_schedule_figure(df, title="Schedule – energia (MWh por passo)"):
     ax.legend()
     return fig
 
-# ---------------------------------------------------------
-# Gráficos exibidos na página (cenário único)
-# ---------------------------------------------------------
 def _plot_compare_baseline_bess(baseline, with_bess):
     fig = _make_compare_figure(baseline, with_bess)
     st.pyplot(fig)
@@ -209,21 +198,19 @@ def _plot_schedule(df, title="Schedule – energia (MWh por passo)"):
     return fig
 
 # ---------------------------------------------------------
-# PDF – cenário único (já existente)
+# PDFs
 # ---------------------------------------------------------
-def _build_pdf(baseline, with_bess, fig_compare, fig_sched, project_name="Projeto", scenario_name="Cenário"):
+def _build_pdf_single(baseline, with_bess, fig_compare, fig_sched, project_name="Projeto", scenario_name="Cenário"):
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     width, height = A4
 
-    # Capa
     c.setFont("Helvetica-Bold", 16)
     c.drawString(2*cm, height-2.5*cm, f"Relatório – {project_name}")
     c.setFont("Helvetica", 12)
     c.drawString(2*cm, height-3.5*cm, f"{scenario_name} | {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
     c.line(2*cm, height-3.8*cm, width-2*cm, height-3.8*cm)
 
-    # KPIs
     y = height-5.0*cm
     c.setFont("Helvetica-Bold", 12)
     c.drawString(2*cm, y, "KPIs principais")
@@ -244,7 +231,6 @@ def _build_pdf(baseline, with_bess, fig_compare, fig_sched, project_name="Projet
         c.drawString(2.3*cm, y, line)
         y -= 0.5*cm
 
-    # Inserir gráfico comparação
     y_img = y - 0.5*cm
     img_w = width - 4*cm
     img_h = 7*cm
@@ -256,7 +242,6 @@ def _build_pdf(baseline, with_bess, fig_compare, fig_sched, project_name="Projet
 
     c.showPage()
 
-    # Segunda página: schedule
     c.setFont("Helvetica-Bold", 12)
     c.drawString(2*cm, height-2.5*cm, "Schedule – energia")
     if fig_sched:
@@ -270,19 +255,12 @@ def _build_pdf(baseline, with_bess, fig_compare, fig_sched, project_name="Projet
     buf.seek(0)
     return buf
 
-# ---------------------------------------------------------
-# PDF – **TODOS os cenários** (novo)
-# ---------------------------------------------------------
 def _build_pdf_multi(results, compare_table, project_name="Energy+BESS – Batch"):
-    """
-    results: lista de dicts [{label, baseline, with_bess}, ...]
-    compare_table: DataFrame com KPIs por cenário (tabela do run_batch_scenarios)
-    """
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     width, height = A4
 
-    # ---- Capa ----
+    # Capa
     c.setFont("Helvetica-Bold", 16)
     c.drawString(2*cm, height-2.5*cm, f"Relatório – {project_name}")
     c.setFont("Helvetica", 12)
@@ -290,44 +268,42 @@ def _build_pdf_multi(results, compare_table, project_name="Energy+BESS – Batch
     c.line(2*cm, height-3.8*cm, width-2*cm, height-3.8*cm)
     c.showPage()
 
-    # ---- Página(s) de resumo com a tabela comparativa ----
+    # Resumo comparativo
     c.setFont("Helvetica-Bold", 13)
     c.drawString(2*cm, height-2.5*cm, "Resumo comparativo (principais KPIs)")
     y = height - 3.3*cm
     c.setFont("Helvetica-Bold", 10)
-    headers = ["Cenário", "E_cap (MWh)", "P_cap (MW)", "EBITDA (EUR/ano)", "LCOE base", "LCOE BESS", "Receita base", "Receita BESS", "Throughput (MWh/ano)"]
-    col_x = [2*cm, 6.2*cm, 8.2*cm, 10.2*cm, 13.2*cm, 15.2*cm, 2*cm, 6.2*cm, 10.2*cm]  # duas linhas para caber
-    # Cabeçalho linha 1
+    headers = ["Cenário", "E_cap (MWh)", "P_cap (MW)", "EBITDA (EUR/ano)",
+               "LCOE base", "LCOE BESS", "Receita base", "Receita BESS", "Throughput (MWh/ano)"]
+    col_x = [2*cm, 6.2*cm, 8.2*cm, 10.2*cm, 13.2*cm, 15.2*cm, 2*cm, 6.2*cm, 10.2*cm]
+    # Cabeçalho (duas linhas para caber)
     c.drawString(col_x[0], y, headers[0])
     c.drawString(col_x[1], y, headers[1])
     c.drawString(col_x[2], y, headers[2])
-    c.drawString(col_x[3], y, headers[3])
-    y -= 0.5*cm
-    # Cabeçalho linha 2
+    c.drawString(col_x[3], y, headers[3]); y -= 0.5*cm
     c.drawString(col_x[4], y, headers[4])
     c.drawString(col_x[5], y, headers[5])
     c.drawString(col_x[6], y, headers[6])
     c.drawString(col_x[7], y, headers[7])
-    c.drawString(col_x[8], y, headers[8])
-    y -= 0.4*cm
-    c.line(2*cm, y, width-2*cm, y)
-    y -= 0.35*cm
+    c.drawString(col_x[8], y, headers[8]); y -= 0.4*cm
+    c.line(2*cm, y, width-2*cm, y); y -= 0.35*cm
     c.setFont("Helvetica", 9)
 
+    import math
     for _, row in compare_table.iterrows():
-        # Linha 1
         if y < 2.5*cm:
             c.showPage()
             c.setFont("Helvetica-Bold", 13)
             c.drawString(2*cm, height-2.5*cm, "Resumo comparativo (continuação)")
             y = height - 3.3*cm
             c.setFont("Helvetica", 9)
+        # linha 1
         c.drawString(col_x[0], y, str(row["Cenário"]))
         c.drawRightString(col_x[1]+1.6*cm, y, f"{row['E_cap_MWh']:.2f}" if pd.notna(row["E_cap_MWh"]) else "-")
         c.drawRightString(col_x[2]+1.6*cm, y, f"{row['P_cap_MW']:.2f}" if pd.notna(row["P_cap_MW"]) else "-")
         c.drawRightString(col_x[3]+3.2*cm, y, f"{row['EBITDA_EUR_ano']:,.0f}" if pd.notna(row["EBITDA_EUR_ano"]) else "-")
         y -= 0.45*cm
-        # Linha 2
+        # linha 2
         c.drawRightString(col_x[4]+1.6*cm, y, f"{row['LCOE_base']:.2f}" if pd.notna(row["LCOE_base"]) else "-")
         c.drawRightString(col_x[5]+1.6*cm, y, f"{row['LCOE_com_BESS']:.2f}" if pd.notna(row["LCOE_com_BESS"]) else "-")
         c.drawRightString(col_x[6]+3.0*cm, y, f"{row['Receita_base_EUR_ano']:,.0f}" if pd.notna(row["Receita_base_EUR_ano"]) else "-")
@@ -337,7 +313,7 @@ def _build_pdf_multi(results, compare_table, project_name="Energy+BESS – Batch
 
     c.showPage()
 
-    # ---- Páginas por cenário ----
+    # Páginas por cenário
     for item in results:
         label = item["label"]
         base = item["baseline"]
@@ -347,7 +323,6 @@ def _build_pdf_multi(results, compare_table, project_name="Energy+BESS – Batch
         c.drawString(2*cm, height-2.5*cm, f"Cenário: {label}")
         c.setFont("Helvetica", 11)
 
-        # KPIs
         y = height - 3.5*cm
         lines = [
             f"LCOE base: {base['LCOE_base_EUR_per_MWh']:.2f} EUR/MWh",
@@ -364,9 +339,7 @@ def _build_pdf_multi(results, compare_table, project_name="Energy+BESS – Batch
             c.drawString(2*cm, y, line)
             y -= 0.55*cm
 
-        # Gráficos por cenário (se houver solução com BESS)
         if w and w.get("status_text", "").startswith("Solução"):
-            # Comparativo
             fig_compare = _make_compare_figure(base, w)
             png1 = io.BytesIO()
             fig_compare.savefig(png1, format="png", bbox_inches="tight")
@@ -380,7 +353,6 @@ def _build_pdf_multi(results, compare_table, project_name="Energy+BESS – Batch
             c.drawImage(ImageReader(png1), 2*cm, y_img - img_h, width=img_w, height=img_h)
             c.showPage()
 
-            # Schedule
             fig_sched = _make_schedule_figure(w["schedule"], f"Schedule – {label}")
             png2 = io.BytesIO()
             fig_sched.savefig(png2, format="png", bbox_inches="tight")
@@ -390,7 +362,6 @@ def _build_pdf_multi(results, compare_table, project_name="Energy+BESS – Batch
             c.drawImage(ImageReader(png2), 2*cm, height-2.5*cm-12*cm, width=width-4*cm, height=10*cm)
             c.showPage()
         else:
-            # Sem solução BESS -> apenas passa para a próxima página
             c.showPage()
 
     c.save()
@@ -427,7 +398,6 @@ if mode == "Cenário único":
         c8.metric("LCOE com BESS (EUR/MWh)", f"{res_bess['LCOE_with_BESS_EUR_per_MWh']:.2f}")
         c9.metric("Throughput (MWh/ano)", f"{res_bess['Throughput_annual_MWh']:.0f}")
 
-        # Gráficos
         st.subheader("Gráficos")
         fig_compare = _plot_compare_baseline_bess(baseline, res_bess)
         fig_sched = _plot_schedule(res_bess["schedule"], "Schedule – Com BESS")
@@ -435,16 +405,15 @@ if mode == "Cenário único":
         st.warning(res_bess.get("status_text", "Falha ao otimizar com BESS."))
         fig_compare, fig_sched = None, None
 
-    # Sensibilidades
-    sens_df = None
-    if res_bess.get("status_text", "").startswith("Solução") and st.checkbox("Mostrar sensibilidades (tabela)", value=True) and run_sens:
+    # Sensibilidades (opcional)
+    if res_bess.get("status_text", "").startswith("Solução") and run_sens and st.checkbox("Mostrar sensibilidades (tabela)", value=True):
         st.header("Sensibilidades – c_E e c_P (±10/±20%)")
         sens_df = run_sensitivities(price_df, gen_df, params_common)
         st.dataframe(sens_df)
 
-    # Exportar PDF (cenário único)
+    # Exportar PDF do cenário único
     st.header("Exportar PDF")
-    pdf_bytes = _build_pdf(
+    pdf_bytes = _build_pdf_single(
         baseline=baseline,
         with_bess=res_bess if res_bess.get("status_text", "").startswith("Solução") else None,
         fig_compare=fig_compare,
@@ -467,7 +436,6 @@ else:
     results, compare_table = run_batch_scenarios(price_df_list, gen_df_list, labels, params_common)
     st.dataframe(compare_table)
 
-    # Pequeno gráfico comparativo de LCOE
     if len(compare_table) > 0:
         fig, ax = plt.subplots()
         ax.bar(compare_table["Cenário"], compare_table["LCOE_base"], label="LCOE base")
@@ -476,7 +444,7 @@ else:
         ax.legend()
         st.pyplot(fig)
 
-    # Exportar PDF de TODOS os cenários (NOVO)
+    # Exporta um único PDF com TODOS os cenários
     st.header("Exportar PDF – TODOS os cenários")
     pdf_all = _build_pdf_multi(results, compare_table, project_name="Energy+BESS – Todos os cenários")
     st.download_button(
@@ -485,28 +453,3 @@ else:
         file_name="energy_bess_all_scenarios.pdf",
         mime="application/pdf",
     )
-
-    # (opcional) Exportar PDF apenas do 1º cenário, como antes
-    if results:
-        base0 = results[0]["baseline"]
-        bess0 = results[0]["with_bess"]
-        fig_compare0 = None
-        fig_sched0 = None
-        if bess0.get("status_text", "").startswith("Solução"):
-            # NÃO exibir; PDFs “único cenário” são auxiliares
-            fig_compare0 = _make_compare_figure(base0, bess0)
-            fig_sched0 = _make_schedule_figure(bess0["schedule"], f"Schedule – {results[0]['label']}")
-        pdf_bytes = _build_pdf(
-            baseline=base0,
-            with_bess=bess0 if bess0.get("status_text", "").startswith("Solução") else None,
-            fig_compare=fig_compare0,
-            fig_sched=fig_sched0,
-            project_name="Energy+BESS",
-            scenario_name=f"Cenário: {results[0]['label']}",
-        )
-        st.download_button(
-            "⬇️ Baixar PDF do 1º cenário (opcional)",
-            data=pdf_bytes,
-            file_name=f"energy_bess_{results[0]['label']}.pdf",
-            mime="application/pdf",
-        )
