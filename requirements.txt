@@ -1,8 +1,6 @@
-streamlit
-pandas
-numpy
-pulp
-openpyxl
-reportlab
-matplotlib
-Pillow
+streamlit>=1.33
+pandas>=2.0
+numpy>=1.24
+matplotlib>=3.7
+pulp>=2.7
+reportlab>=4.0
