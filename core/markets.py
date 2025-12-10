@@ -2,7 +2,22 @@
 from __future__ import annotations
 from typing import List, Tuple, Dict
 import pandas as pd
-from entsoe import EntsoePandasClient, CountryCode
+
+# --- Import do entsoe-py com fallback seguro ---
+try:
+    from entsoe import EntsoePandasClient, CountryCode  # type: ignore
+    _ENTSOE_AVAILABLE = True
+except Exception:
+    # Pacote não instalado ou bloqueado no ambiente
+    EntsoePandasClient = None  # type: ignore
+    CountryCode = None         # type: ignore
+    _ENTSOE_AVAILABLE = False
+
+
+def entsoe_available() -> bool:
+    """Indica se o entsoe-py está disponível para uso da API."""
+    return _ENTSOE_AVAILABLE
+
 
 # Lista para o seletor
 COUNTRY_CHOICES: list[tuple[str, str]] = [
@@ -16,8 +31,7 @@ COUNTRY_CHOICES: list[tuple[str, str]] = [
     ("Latvia", "LV"), ("Estonia", "EE"), ("Ireland", "IE"),
 ]
 
-# Presets (valores SUGERIDOS; ajuste conforme seu caso/DSO)
-# import/export em €/MWh e limites em MW
+# Presets (valores de referência; ajuste conforme o DSO/mercado)
 COUNTRY_TARIFF_PRESETS: Dict[str, Dict[str, float]] = {
     "PT": {"import_fee": 7.0, "export_fee": 1.0, "P_imp": 200.0, "P_exp": 200.0},
     "ES": {"import_fee": 6.0, "export_fee": 1.0, "P_imp": 200.0, "P_exp": 200.0},
@@ -47,6 +61,7 @@ COUNTRY_TARIFF_PRESETS: Dict[str, Dict[str, float]] = {
 def get_country_defaults(alpha2: str) -> Dict[str, float]:
     return COUNTRY_TARIFF_PRESETS.get(alpha2, {"import_fee": 0.0, "export_fee": 0.0, "P_imp": 200.0, "P_exp": 200.0})
 
+
 def _to_utc_15s(df: pd.DataFrame, col_time="datetime", col_price="price_EUR_per_MWh") -> pd.DataFrame:
     out = df.copy()
     out[col_time] = pd.to_datetime(out[col_time], utc=True)
@@ -54,16 +69,29 @@ def _to_utc_15s(df: pd.DataFrame, col_time="datetime", col_price="price_EUR_per_
     out = out.resample("15S").ffill()
     out = out.reset_index()
     out.rename(columns={"index": "datetime"}, inplace=True)
-    return out[[ "datetime", col_price ]]
+    return out[["datetime", col_price]]
+
 
 def fetch_entsoe_day_ahead_prices(country_alpha2: str, start_date: str, end_date: str, token: str) -> pd.DataFrame:
+    """
+    Retorna DataFrame (UTC, 15 s): datetime, price_EUR_per_MWh.
+    Lança erro amigável se `entsoe-py` não estiver disponível.
+    """
+    if not _ENTSOE_AVAILABLE:
+        raise RuntimeError(
+            "A API ENTSO-E não está disponível neste ambiente. "
+            "Adicione 'entsoe-py' ao requirements.txt e redeploy (ou use CSV de preços)."
+        )
     if not token:
         raise ValueError("Informe o token ENTSO-E.")
+
     cc = getattr(CountryCode, country_alpha2)
     client = EntsoePandasClient(api_key=token)
+
     tz = "Europe/Brussels"
     start = pd.Timestamp(start_date, tz=tz)
     end   = pd.Timestamp(end_date,   tz=tz) + pd.Timedelta(days=1)
+
     chunks = []
     cur = start
     while cur < end:
@@ -72,10 +100,12 @@ def fetch_entsoe_day_ahead_prices(country_alpha2: str, start_date: str, end_date
         if s is not None and len(s) > 0:
             chunks.append(s)
         cur = nxt
+
     if not chunks:
-        raise RuntimeError("Sem dados ENTSO-E para o período.")
+        raise RuntimeError("Sem dados ENTSO-E para o período informado.")
+
     series = pd.concat(chunks).sort_index()
     series = series[~series.index.duplicated(keep="last")]
-    df = series.to_frame("price_EUR_per_MWh").reset_index().rename(columns={"index":"datetime"})
+    df = series.to_frame("price_EUR_per_MWh").reset_index().rename(columns={"index": "datetime"})
     df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_convert("UTC")
     return _to_utc_15s(df, col_time="datetime", col_price="price_EUR_per_MWh")
