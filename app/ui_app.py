@@ -53,27 +53,35 @@ price_df = None
 country_name = None
 country_code = None
 
-if price_source == "API ENTSO-E (day-ahead)":
-    names = [c[0] for c in COUNTRY_CHOICES]
-    code_by_name = {c[0]: c[1] for c in COUNTRY_CHOICES}
-    c1, c2, c3, c4 = st.columns([1.3, 1, 1, 1])
-    with c1:
-        country_name = st.selectbox("País / Zona", names, index=names.index("Portugal") if "Portugal" in names else 0)
-        country_code = code_by_name[country_name]
-    with c2:
-        start_date = st.date_input("Início", value=pd.Timestamp.utcnow().date().replace(month=1, day=1))
-    with c3:
-        end_date   = st.date_input("Fim", value=pd.Timestamp.utcnow().date())
-    with c4:
-        entsoe_token = st.text_input("Token ENTSO-E", type="password")
+# IMPORTANTE: checar disponibilidade do entsoe-py
+from core.markets import entsoe_available
 
-    if st.button("🔎 Buscar preços"):
-        with st.spinner("Baixando ENTSO-E..."):
-            try:
-                price_df = fetch_entsoe_day_ahead_prices(country_code, str(start_date), str(end_date), entsoe_token)
-                st.success(f"Preços carregados: {len(price_df):,} amostras (15 s).")
-            except Exception as e:
-                st.error(f"Falha ENTSO-E: {e}")
+if price_source == "API ENTSO-E (day-ahead)":
+    if not entsoe_available():
+        st.error("API ENTSO-E indisponível neste ambiente. "
+                 "Adicione `entsoe-py` ao requirements.txt e redeploy, "
+                 "ou use **Arquivo CSV** para os preços.")
+    else:
+        names = [c[0] for c in COUNTRY_CHOICES]
+        code_by_name = {c[0]: c[1] for c in COUNTRY_CHOICES}
+        c1, c2, c3, c4 = st.columns([1.3, 1, 1, 1])
+        with c1:
+            country_name = st.selectbox("País / Zona", names, index=names.index("Portugal") if "Portugal" in names else 0)
+            country_code = code_by_name[country_name]
+        with c2:
+            start_date = st.date_input("Início", value=pd.Timestamp.utcnow().date().replace(month=1, day=1))
+        with c3:
+            end_date   = st.date_input("Fim", value=pd.Timestamp.utcnow().date())
+        with c4:
+            entsoe_token = st.text_input("Token ENTSO-E", type="password")
+
+        if st.button("🔎 Buscar preços"):
+            with st.spinner("Baixando ENTSO-E..."):
+                try:
+                    price_df = fetch_entsoe_day_ahead_prices(country_code, str(start_date), str(end_date), entsoe_token)
+                    st.success(f"Preços carregados: {len(price_df):,} amostras (15 s).")
+                except Exception as e:
+                    st.error(f"Falha ENTSO-E: {e}")
 else:
     up = st.file_uploader("Preços CSV: `datetime,price_EUR_per_MWh` (15 s ou maior)", type=["csv"])
     if up:
@@ -82,7 +90,7 @@ else:
         price_df = tmp.sort_values("datetime").set_index("datetime").resample("15S").ffill().reset_index()[["datetime","price_EUR_per_MWh"]]
 
 if price_df is None:
-    st.info("Carregue os **preços** para continuar.")
+    st.info("Carregue os **preços** (API ENTSO-E ou CSV) para continuar.")
     st.stop()
 
 # ===========================
