@@ -54,7 +54,7 @@ def make_utc_15s_range(d0, d1):
     idx = pd.date_range(
         start=pd.Timestamp(d0).tz_localize("UTC"),
         end=pd.Timestamp(d1).tz_localize("UTC") + pd.Timedelta(days=1) - pd.Timedelta(seconds=15),
-        freq="15S",
+        freq="15s",
         inclusive="both",
     )
     return idx
