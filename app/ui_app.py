@@ -39,41 +39,101 @@ with st.expander("Como funciona (30s)"):
 - **Saídas**: Receita anual, EBITDA, ROI, payback, throughput, LCOE etc.
 """)
 
-# =====================================================
-# 1) PREÇOS – ENTSO-E
-# =====================================================
+# ===========================
+#  PREÇOS – ENTSO-E OU SINTÉTICO (SEM UPLOAD)
+# ===========================
 st.header("Preços spot (ENTSO-E day-ahead)")
 
-if not entsoe_available():
-    st.error("API ENTSO-E indisponível neste ambiente. "
-             "Inclua `entsoe-py==0.6.11` no requirements.txt e redeploy.")
-    st.stop()
-
-names = [c[0] for c in COUNTRY_CHOICES]
-code_by_name = {c[0]: c[1] for c in COUNTRY_CHOICES}
-
-cA, cB, cC, cD = st.columns([1.2, 1, 1, 1.2])
-with cA:
-    country_name = st.selectbox("País/Zona", names, index=names.index("Portugal") if "Portugal" in names else 0)
-    country_code = code_by_name[country_name]
-with cB:
-    start_date = st.date_input("Início", value=pd.Timestamp.utcnow().date().replace(month=1, day=1))
-with cC:
-    end_date   = st.date_input("Fim", value=pd.Timestamp.utcnow().date())
-with cD:
-    entsoe_token = st.text_input("Token ENTSO-E", type="password")
+from core.markets import entsoe_available
 
 price_df = None
-if st.button("🔎 Buscar preços no ENTSO-E"):
-    with st.spinner("Baixando preços day-ahead..."):
-        try:
-            price_df = fetch_entsoe_day_ahead_prices(country_code, str(start_date), str(end_date), entsoe_token)
-            st.success(f"OK! {len(price_df):,} amostras (15 s).")
-        except Exception as e:
-            st.error(f"Falha ENTSO-E: {e}")
+country_name = None
+country_code = None
+
+def make_utc_15s_range(d0, d1):
+    idx = pd.date_range(
+        start=pd.Timestamp(d0).tz_localize("UTC"),
+        end=pd.Timestamp(d1).tz_localize("UTC") + pd.Timedelta(days=1) - pd.Timedelta(seconds=15),
+        freq="15S",
+        inclusive="both",
+    )
+    return idx
+
+def synth_prices(index_utc: pd.DatetimeIndex,
+                 base_eur_mwh: float = 65.0,
+                 diurnal_amplitude: float = 25.0,
+                 volatility: float = 0.30,
+                 neg_share: float = 0.25,
+                 lower: float = -150.0,
+                 upper: float = 350.0) -> pd.DataFrame:
+    idx = pd.DatetimeIndex(pd.to_datetime(index_utc, utc=True))
+    h = idx.hour.values + idx.minute.values/60 + idx.second.values/3600
+    phi = np.pi * (h - 19.0) / 6.0  # pico de preço ~19h UTC
+    shape = np.cos(phi)
+    shape = (shape + 1.0) / 2.0    # 0..1
+    # sazonal simplificada por mês
+    month_vec = np.array([0.9,0.95,1.0,0.95,0.9,0.85,0.85,0.9,0.95,1.0,1.05,1.0])
+    m = idx.month.values
+    season = month_vec[m-1]
+    core = base_eur_mwh*season + diurnal_amplitude*shape
+    noise = np.random.normal(0.0, volatility*base_eur_mwh, size=len(idx))
+    p = core + noise
+    # força fração de negativos (ordena e empurra cauda para baixo)
+    k = int(len(p)*neg_share)
+    if k > 0:
+        order = np.argsort(p)
+        tail = order[:k]
+        p[tail] = np.linspace(lower, np.percentile(p, 5), k)
+    # clip geral
+    p = np.clip(p, lower, upper)
+    return pd.DataFrame({"datetime": idx, "price_EUR_per_MWh": p})
+
+# UI
+names = [c[0] for c in COUNTRY_CHOICES]
+code_by_name = {c[0]: c[1] for c in COUNTRY_CHOICES}
+c1, c2, c3 = st.columns([1.2, 1, 1])
+
+with c1:
+    country_name = st.selectbox("País/Zona", names, index=names.index("Portugal") if "Portugal" in names else 0)
+    country_code = code_by_name[country_name]
+with c2:
+    start_date = st.date_input("Início", value=pd.Timestamp.utcnow().date().replace(month=1, day=1))
+with c3:
+    end_date   = st.date_input("Fim", value=pd.Timestamp.utcnow().date())
+
+if entsoe_available():
+    t = st.text_input("Token ENTSO-E", type="password")
+    if st.button("🔎 Buscar preços no ENTSO-E"):
+        with st.spinner("Baixando preços day-ahead..."):
+            try:
+                price_df = fetch_entsoe_day_ahead_prices(country_code, str(start_date), str(end_date), t)
+                st.success(f"OK! {len(price_df):,} amostras (15 s).")
+            except Exception as e:
+                st.error(f"Falha ENTSO-E: {e}")
+else:
+    st.warning("ENTSO-E indisponível neste ambiente. Use **Preços sintéticos** abaixo.")
+    with st.expander("Preços sintéticos (sem upload) – configurar"):
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            base = st.number_input("Preço base (€/MWh)", 0.0, value=65.0, step=1.0)
+            amp  = st.number_input("Amplitude diurna (€/MWh)", 0.0, value=25.0, step=1.0)
+        with b2:
+            vol  = st.number_input("Volatilidade (fração do base)", 0.0, 2.0, 0.30, 0.05)
+            neg  = st.number_input("Share de preços negativos (%)", 0.0, 100.0, 25.0, 1.0)
+        with b3:
+            low  = st.number_input("Mínimo (€/MWh)", -2000.0, value=-150.0, step=25.0)
+            high = st.number_input("Máximo (€/MWh)", 0.0, value=350.0, step=25.0)
+
+    if st.button("⚡ Gerar preços sintéticos"):
+        idx = make_utc_15s_range(start_date, end_date)
+        np.random.seed(42)  # reprodutível
+        price_df = synth_prices(idx, base_eur_mwh=base, diurnal_amplitude=amp,
+                                volatility=vol, neg_share=neg/100.0,
+                                lower=low, upper=high)
+        st.success(f"Gerados {len(price_df):,} pontos de preço (15 s).")
 
 if price_df is None:
-    st.info("Busque os **preços** no ENTSO-E para continuar.")
+    st.info("Carregue ou gere os preços para continuar.")
     st.stop()
 
 # =====================================================
