@@ -13,10 +13,16 @@ from core.optimization import (
     optimize_site_bess_mw,
 )
 
+from core.markets import (
+    COUNTRY_CHOICES,
+    fetch_entsoe_day_ahead_prices,
+)
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+
 
 # ---------- formatação PT/BR ----------
 def fmt_pt(x, d=0):
@@ -28,42 +34,106 @@ def fmt_pt(x, d=0):
 
 def euro(x, d=0): return f"€ {fmt_pt(x, d)}"
 
+
 st.set_page_config(page_title="Calculadora BESS (MW, 15 s)", layout="wide")
-st.title("Calculadora BESS — em MW (dados 15 s)")
+st.title("Calculadora BESS — em MW (day-ahead + dados 15 s)")
 
-with st.expander("ℹ️ Instruções rápidas"):
+with st.expander("Como usar a calculadora"):
     st.markdown("""
-**Arquivos CSV (mesmo período, amostragem 15 s):**  
-- Preços: `datetime,price_EUR_per_MWh`  
-- PV (opcional): `datetime,pv_MW`  
-- Carga (opcional): `datetime,load_MW`
-
-**Cenários suportados:** arbitragem pura; consumo+arbitragem; PV+arbitragem; PV+consumo+arbitragem.  
-**BESS em MW:** define **P (MW)** e **C-rate (1/h)** → energia **E (MWh) = P/C**.
+1) Na seção **Fonte de preços**, escolha **API ENTSO-E (day-ahead)** ou **Arquivo CSV**.  
+   - API: selecione o **país**, período, cole o **token** ENTSO-E e clique **Buscar preços**.  
+   - CSV: envie um arquivo `datetime,price_EUR_per_MWh`.  
+2) Envie (opcional) **PV** `datetime,pv_MW` e **Carga** `datetime,load_MW` — ambos em MW e 15 s.  
+3) Ajuste **taxas (€/MWh)** e **limites de rede (MW)**.  
+4) Defina **P_bess (MW)** e **C-rate (1/h)** **ou** use **Otimizar (P e C-rate)**.  
+5) Veja **KPIs** (EBITDA, ROI, Payback, LCOE) e baixe o PDF.
 """)
 
-# ---------------- uploads ----------------
-c1, c2, c3 = st.columns(3)
-with c1:
-    f_price = st.file_uploader("Preços (CSV, 15 s)", type=["csv"])
-    price_df = pd.read_csv(f_price) if f_price else None
-with c2:
-    f_pv = st.file_uploader("PV (CSV, 15 s) — opcional", type=["csv"])
-    pv_df = pd.read_csv(f_pv) if f_pv else None
-with c3:
-    f_load = st.file_uploader("Carga (CSV, 15 s) — opcional", type=["csv"])
-    load_df = pd.read_csv(f_load) if f_load else None
+# ===========================
+#  FONTE DE PREÇOS
+# ===========================
+st.header("Fonte de preços (spot day-ahead)")
+
+price_source = st.radio("Escolha a fonte",
+                        ["API ENTSO-E (day-ahead)", "Arquivo CSV"],
+                        horizontal=True)
+
+price_df = None
+
+if price_source == "API ENTSO-E (day-ahead)":
+    c1, c2, c3, c4 = st.columns([1.1,1,1,1])
+    with c1:
+        display = [c[0] for c in COUNTRY_CHOICES]
+        code_by_name = {c[0]: c[1] for c in COUNTRY_CHOICES}
+        country_name = st.selectbox("País / Zona", display, index=display.index("Portugal") if "Portugal" in display else 0)
+        country_code = code_by_name[country_name]
+    with c2:
+        start_date = st.date_input("Início", value=pd.Timestamp.utcnow().date().replace(month=1, day=1))
+    with c3:
+        end_date   = st.date_input("Fim", value=pd.Timestamp.utcnow().date())
+    with c4:
+        entsoe_token = st.text_input("Token ENTSO-E", type="password", help="Crie em transparency.entsoe.eu → Settings → API Token")
+
+    btn = st.button("🔎 Buscar preços")
+    if btn:
+        with st.spinner("Baixando preços day-ahead da ENTSO-E..."):
+            try:
+                price_df = fetch_entsoe_day_ahead_prices(
+                    country_alpha2=country_code,
+                    start_date=str(start_date),
+                    end_date=str(end_date),
+                    token=entsoe_token,
+                )
+                st.success(f"Preços carregados: {len(price_df):,} amostras (15 s).")
+            except Exception as e:
+                st.error(f"Falha ao obter preços da ENTSO-E: {e}")
+
+else:
+    f_price = st.file_uploader("Preços (CSV, 15 s): `datetime,price_EUR_per_MWh`", type=["csv"])
+    if f_price:
+        tmp = pd.read_csv(f_price)
+        # normaliza para 15 s e UTC
+        tmp["datetime"] = pd.to_datetime(tmp["datetime"], utc=True)
+        tmp = tmp.sort_values("datetime")
+        tmp = tmp.set_index("datetime").resample("15S").ffill().reset_index()
+        price_df = tmp[["datetime","price_EUR_per_MWh"]]
 
 if price_df is None:
-    st.info("Envie ao menos o CSV de **preços**.")
+    st.info("Carregue os **preços** pela API ou CSV para continuar.")
     st.stop()
 
-# ------------- parâmetros -------------
-st.header("Preços / Rede / Custos")
+# ===========================
+#  PV / CARGA (opcionais)
+# ===========================
+st.header("Séries opcionais (MW, 15 s)")
+
+c1, c2 = st.columns(2)
+with c1:
+    f_pv = st.file_uploader("PV (CSV, 15 s) — `datetime,pv_MW`", type=["csv"])
+    pv_df = None
+    if f_pv:
+        pv_df = pd.read_csv(f_pv)
+        pv_df["datetime"] = pd.to_datetime(pv_df["datetime"], utc=True)
+        pv_df = pv_df.sort_values("datetime").set_index("datetime").resample("15S").ffill().reset_index()[["datetime","pv_MW"]]
+with c2:
+    f_load = st.file_uploader("Carga (CSV, 15 s) — `datetime,load_MW`", type=["csv"])
+    load_df = None
+    if f_load:
+        load_df = pd.read_csv(f_load)
+        load_df["datetime"] = pd.to_datetime(load_df["datetime"], utc=True)
+        load_df = load_df.sort_values("datetime").set_index("datetime").resample("15S").ffill().reset_index()[["datetime","load_MW"]]
+
+# ===========================
+#  PREÇOS/REDE/CUSTOS
+# ===========================
+st.header("Parâmetros de preço, rede e custos")
+
 colA, colB, colC = st.columns(3)
 with colA:
-    import_fee = st.number_input("Tarifa de importação (€/MWh)", 0.0, value=0.0, step=1.0)
-    export_fee = st.number_input("Tarifa de exportação (€/MWh)", 0.0, value=0.0, step=1.0)
+    import_fee = st.number_input("Tarifa de importação (€/MWh)", 0.0, value=0.0, step=1.0,
+                                 help="Taxa do fornecedor + rede ao importar")
+    export_fee = st.number_input("Tarifa de exportação (€/MWh)", 0.0, value=0.0, step=1.0,
+                                 help="Taxa de rede/market maker ao exportar")
     P_imp = st.number_input("Limite de importação (MW)", 0.0, value=200.0, step=5.0)
 with colB:
     P_exp = st.number_input("Limite de exportação (MW)", 0.0, value=200.0, step=5.0)
@@ -72,13 +142,13 @@ with colB:
 with colC:
     deg_cost = st.number_input("Degradação (€/MWh descarregado)", 0.0, value=2.0, step=0.5)
     opex_fix_bess = st.number_input("OPEX fixo BESS (€/ano)", 0.0, value=60_000.0, step=5_000.0)
-    opex_fix_gen  = st.number_input("OPEX fixo usina (€/ano) — se houver", 0.0, value=0.0, step=10_000.0)
+    opex_fix_gen  = st.number_input("OPEX fixo usina (€/ano)", 0.0, value=0.0, step=10_000.0)
 
 colD, colE, colF = st.columns(3)
 with colD:
     opex_var_trade = st.number_input("OPEX var. mercado (€/MWh)", 0.0, value=0.5, step=0.1)
     opex_var_gen   = st.number_input("OPEX var. geração (€/MWh)", 0.0, value=0.0, step=0.1)
-    capex_gen = st.number_input("CAPEX usina (EUR) — se houver", 0.0, value=0.0, step=100_000.0)
+    capex_gen = st.number_input("CAPEX usina (EUR)", 0.0, value=0.0, step=100_000.0)
 with colE:
     discount = st.number_input("Taxa de desconto (%)", 0.0, value=8.0, step=0.5)
     lifetime = st.number_input("Vida útil (anos)", 1, value=15, step=1)
@@ -88,7 +158,7 @@ with colF:
     soc_min = st.number_input("SoC mínimo (%)", 0.0, 100.0, 0.0, step=5.0)
     soc_max = st.number_input("SoC máximo (%)", 0.0, 100.0, 100.0, step=5.0)
 
-st.subheader("CAPEX BESS")
+st.subheader("CAPEX BESS (€/kWh e €/kW)")
 cE, cP = st.columns(2)
 with cE:
     capex_E = st.number_input("CAPEX (€/kWh)", 0.0, value=250.0, step=10.0)
@@ -118,16 +188,22 @@ params = {
     "solver_time_limit_s": solver_time,
 }
 
-# ------------- baselines -------------
+# ===========================
+#  BASELINES
+# ===========================
 st.header("Baselines (referência)")
 base = baselines_mw(price_df, pv_df, load_df, import_fee, export_fee)
 b1, b2 = st.columns(2)
 b1.metric("Custo consumo (sem PV/BESS)", euro(base["Cost_consumption_annual_EUR"], 0))
 b2.metric("Receita só solar (exportando tudo)", euro(base["Revenue_solar_only_annual_EUR"], 0))
 
-# ------------- BESS -------------
+# ===========================
+#  BESS — FIXO ou OTIMIZAR
+# ===========================
 st.header("BESS — definir P (MW) e C-rate (1/h)")
 mode = st.radio("Modo", ["Rodar tamanho fixo", "Otimizar (P e C-rate)"], horizontal=True)
+
+from core.optimization import run_site_bess_mw, optimize_site_bess_mw
 
 if mode == "Rodar tamanho fixo":
     cc1, cc2 = st.columns(2)
@@ -152,7 +228,9 @@ else:
     C_vals = np.linspace(C_min, C_max, N)
     res = optimize_site_bess_mw(price_df, pv_df, load_df, params, P_vals, C_vals, objective)
 
-# ------------- resultados -------------
+# ===========================
+#  RESULTADOS
+# ===========================
 st.subheader("Resultados")
 r1, r2, r3 = st.columns(3)
 r1.metric("P_bess (MW)", fmt_pt(res["P_cap_MW"], 2))
@@ -185,7 +263,9 @@ if "schedule" in res:
     ax.legend(ncol=3); ax.set_title("Fluxos (MWh por passo)"); ax.grid(True, alpha=0.2)
     st.pyplot(fig)
 
-# ------------- PDF -------------
+# ===========================
+#  PDF
+# ===========================
 st.header("Exportar PDF (resumo)")
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
