@@ -121,14 +121,14 @@ def run_baseline(price_df: pd.DataFrame,
     }
 
 # =========================================================
-# Otimização com BESS (MILP) – com linearização Big-M
+# Otimização com BESS (MILP) – Big-M linearization
 # =========================================================
 def run_with_bess(price_df: pd.DataFrame,
                   gen_df: pd.DataFrame,
                   params: dict) -> dict:
     """
     Maximiza o EBITDA anual com MILP:
-      - Proíbe carga e descarga simultâneas usando Big-M (sem produto var×binária).
+      - Proíbe carga e descarga simultâneas via Big-M (sem produto de variáveis).
       - Permite carga da rede (opcional) com limite de importação.
       - Degradação via custo por throughput (€/MWh_throughput).
       - Limite de ciclos/ano: throughput_annual <= 2 * E_cap * cycles_per_year_max
@@ -151,9 +151,8 @@ def run_with_bess(price_df: pd.DataFrame,
     imp_cap = (params.get("P_grid_import_max", 0.0) if params.get("P_grid_import_max", 0.0) > 0 else 1e12) * dt
 
     # Big-M (constante por passo) para alternância carga/descarga
-    # usa o maior limite de energia possível no passo
     g_max = float(df["gen_MWh"].max()) if T > 0 else 0.0
-    M_step = max(exp_cap, imp_cap, g_max + imp_cap) + 1.0  # margem
+    M_step = max(exp_cap, imp_cap, g_max + imp_cap) + 1.0
 
     # Parâmetros do BESS
     eta_c = float(params.get("eta_charge", 0.95))
@@ -212,13 +211,13 @@ def run_with_bess(price_df: pd.DataFrame,
     grid_cost_series = pulp.lpSum([price[t] * c_grid[t] for t in range(T)])
     energy_series = pulp.lpSum([s_dir[t] + d[t] for t in range(T)])
 
-    revenue_annual = af * revenue_series
-    grid_cost_annual = af * grid_cost_series
-    energy_annual = af * energy_series
+    revenue_annual = _annual_factor(T, dt) * revenue_series
+    grid_cost_annual = _annual_factor(T, dt) * grid_cost_series
+    energy_annual = _annual_factor(T, dt) * energy_series
 
-    # Throughput anual aproximado = carga + descarga (MWh), anualizado
+    # Throughput anual aproximado (carga + descarga)
     throughput_series = pulp.lpSum([(c_ren[t] + c_grid[t]) + d[t] for t in range(T)])
-    throughput_annual = af * throughput_series
+    throughput_annual = _annual_factor(T, dt) * throughput_series
 
     # Limite de ciclos/ano
     if cycles_max > 0:
@@ -275,7 +274,7 @@ def run_with_bess(price_df: pd.DataFrame,
     bess_annual_cost_val = annualized_cost(bess_capex_val, params["discount_rate"], int(params["lifetime_years"]))
     ebitda_val = pulp.value(ebitda_annual)
 
-    # LCOE com BESS
+    # LCOE com BESS (inclui CAPEX da usina + BESS)
     lcoe_with_bess = lcoe_annual(
         capex_total_eur=params["capex_gen"] + bess_capex_val,
         rate_percent=params["discount_rate"],
