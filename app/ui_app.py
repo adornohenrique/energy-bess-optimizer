@@ -11,14 +11,13 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-from core.optimization import (
-    baselines_mw, run_site_bess_mw, optimize_site_bess_mw,
-)
+from core.optimization import run_site_bess_mw, baselines_mw
 from core.markets import (
-    COUNTRY_CHOICES, get_country_defaults, fetch_entsoe_day_ahead_prices,
+    COUNTRY_CHOICES, get_country_defaults,
+    fetch_entsoe_day_ahead_prices, entsoe_available,
 )
 
-# ---------- formatação ----------
+# -------------------- formatação --------------------
 def fmt_pt(x, d=0):
     try:
         s = f"{float(x):,.{d}f}"
@@ -28,347 +27,302 @@ def fmt_pt(x, d=0):
 
 def euro(x, d=0): return f"€ {fmt_pt(x, d)}"
 
-st.set_page_config(page_title="Calculadora BESS (MW) — Pro", layout="wide")
-st.title("Calculadora BESS — em MW (ENTSO-E + TOU + AC/DC + SoC)")
 
-with st.expander("Como usar", expanded=False):
+st.set_page_config(page_title="BESS – modo simples (MW)", layout="wide")
+st.title("BESS – modo simples (MW) • Sem upload de arquivos")
+
+with st.expander("Como funciona (30s)"):
     st.markdown("""
-**Fluxo:**  
-1) Escolha **Fonte de preços** (API ENTSO-E ou CSV) — os preços são alinhados a **15 s**.  
-2) (Opcional) Envie **PV** e **Carga** (`datetime,pv_MW` e `datetime,load_MW`, ambos em MW, passo 15 s).  
-3) **País / Presets**: aplique presets de **tarifas e limites** (ou ajuste manualmente).  
-4) **TOU**: carregue **CSV** de tarifas por data/hora ou use **modo simples** (pico/fora-pico).  
-5) Ajuste **eficiências**, **perdas AC/DC**, **SoC inicial/final**.  
-6) Rode **tamanho fixo** ou **otimize (P e C-rate)**.  
-7) Baixe o **PDF**.
+- **Preços**: buscados na API **ENTSO-E** (precisa de token).  
+- **PV**: gerado automaticamente a partir de **MWp** e **yield anual** (kWh/kWp·ano).  
+- **Nada de uploads** — só parâmetros.  
+- **Saídas**: Receita anual, EBITDA, ROI, payback, throughput, LCOE etc.
 """)
 
-# ===========================
-#  FONTE DE PREÇOS
-# ===========================
-st.header("Fonte de preços (spot day-ahead)")
-price_source = st.radio("Escolha a fonte", ["API ENTSO-E (day-ahead)", "Arquivo CSV"], horizontal=True)
+# =====================================================
+# 1) PREÇOS – ENTSO-E
+# =====================================================
+st.header("Preços spot (ENTSO-E day-ahead)")
 
-price_df = None
-country_name = None
-country_code = None
-
-# IMPORTANTE: checar disponibilidade do entsoe-py
-from core.markets import entsoe_available
-
-if price_source == "API ENTSO-E (day-ahead)":
-    if not entsoe_available():
-        st.error("API ENTSO-E indisponível neste ambiente. "
-                 "Adicione `entsoe-py` ao requirements.txt e redeploy, "
-                 "ou use **Arquivo CSV** para os preços.")
-    else:
-        names = [c[0] for c in COUNTRY_CHOICES]
-        code_by_name = {c[0]: c[1] for c in COUNTRY_CHOICES}
-        c1, c2, c3, c4 = st.columns([1.3, 1, 1, 1])
-        with c1:
-            country_name = st.selectbox("País / Zona", names, index=names.index("Portugal") if "Portugal" in names else 0)
-            country_code = code_by_name[country_name]
-        with c2:
-            start_date = st.date_input("Início", value=pd.Timestamp.utcnow().date().replace(month=1, day=1))
-        with c3:
-            end_date   = st.date_input("Fim", value=pd.Timestamp.utcnow().date())
-        with c4:
-            entsoe_token = st.text_input("Token ENTSO-E", type="password")
-
-        if st.button("🔎 Buscar preços"):
-            with st.spinner("Baixando ENTSO-E..."):
-                try:
-                    price_df = fetch_entsoe_day_ahead_prices(country_code, str(start_date), str(end_date), entsoe_token)
-                    st.success(f"Preços carregados: {len(price_df):,} amostras (15 s).")
-                except Exception as e:
-                    st.error(f"Falha ENTSO-E: {e}")
-else:
-    up = st.file_uploader("Preços CSV: `datetime,price_EUR_per_MWh` (15 s ou maior)", type=["csv"])
-    if up:
-        tmp = pd.read_csv(up)
-        tmp["datetime"] = pd.to_datetime(tmp["datetime"], utc=True)
-        price_df = tmp.sort_values("datetime").set_index("datetime").resample("15S").ffill().reset_index()[["datetime","price_EUR_per_MWh"]]
-
-if price_df is None:
-    st.info("Carregue os **preços** (API ENTSO-E ou CSV) para continuar.")
+if not entsoe_available():
+    st.error("API ENTSO-E indisponível neste ambiente. "
+             "Inclua `entsoe-py==0.6.11` no requirements.txt e redeploy.")
     st.stop()
 
-# ===========================
-#  PV / CARGA (opcionais)
-# ===========================
-st.header("PV e Carga (opcionais, MW em 15 s)")
+names = [c[0] for c in COUNTRY_CHOICES]
+code_by_name = {c[0]: c[1] for c in COUNTRY_CHOICES}
+
+cA, cB, cC, cD = st.columns([1.2, 1, 1, 1.2])
+with cA:
+    country_name = st.selectbox("País/Zona", names, index=names.index("Portugal") if "Portugal" in names else 0)
+    country_code = code_by_name[country_name]
+with cB:
+    start_date = st.date_input("Início", value=pd.Timestamp.utcnow().date().replace(month=1, day=1))
+with cC:
+    end_date   = st.date_input("Fim", value=pd.Timestamp.utcnow().date())
+with cD:
+    entsoe_token = st.text_input("Token ENTSO-E", type="password")
+
+price_df = None
+if st.button("🔎 Buscar preços no ENTSO-E"):
+    with st.spinner("Baixando preços day-ahead..."):
+        try:
+            price_df = fetch_entsoe_day_ahead_prices(country_code, str(start_date), str(end_date), entsoe_token)
+            st.success(f"OK! {len(price_df):,} amostras (15 s).")
+        except Exception as e:
+            st.error(f"Falha ENTSO-E: {e}")
+
+if price_df is None:
+    st.info("Busque os **preços** no ENTSO-E para continuar.")
+    st.stop()
+
+# =====================================================
+# 2) PV SINTÉTICO (sem upload)
+# =====================================================
+st.header("Usina fotovoltaica (sem upload)")
+
+# Sugestões rápidas de yield (kWh/kWp·ano)
+YIELD_HINTS = {
+    "Portugal": 1750, "Spain": 1800, "France": 1350, "Germany (DE-LU)": 1150,
+    "Italy": 1500, "Netherlands": 1100, "Belgium": 1100, "Poland": 1050,
+    "Greece": 1700, "Finland": 950, "Sweden": 1000, "Norway": 900,
+}
+
+hint = YIELD_HINTS.get(country_name, 1300)
+
 c1, c2 = st.columns(2)
 with c1:
-    f_pv = st.file_uploader("PV CSV (`datetime,pv_MW`)", type=["csv"])
-    pv_df = None
-    if f_pv:
-        pv_df = pd.read_csv(f_pv)
-        pv_df["datetime"] = pd.to_datetime(pv_df["datetime"], utc=True)
-        pv_df = pv_df.sort_values("datetime").set_index("datetime").resample("15S").ffill().reset_index()[["datetime","pv_MW"]]
+    mwp = st.number_input("Capacidade instalada (MWp)", 0.0, value=100.0, step=5.0)
 with c2:
-    f_load = st.file_uploader("Carga CSV (`datetime,load_MW`)", type=["csv"])
-    load_df = None
-    if f_load:
-        load_df = pd.read_csv(f_load)
-        load_df["datetime"] = pd.to_datetime(load_df["datetime"], utc=True)
-        load_df = load_df.sort_values("datetime").set_index("datetime").resample("15S").ffill().reset_index()[["datetime","load_MW"]]
+    yield_kwh_per_kwp = st.number_input("Yield anual (kWh/kWp·ano)", 200.0, value=float(hint), step=50.0)
 
-# ===========================
-#  PRESETS POR PAÍS
-# ===========================
-st.header("País e presets (taxas e limites)")
-if "grid_params" not in st.session_state:
-    st.session_state.grid_params = {}
+st.caption("Dica: PT ≈ 1 650–1 800 • ES ≈ 1 700–1 900 • DE ≈ 1 050–1 200 • IT ≈ 1 400–1 600")
 
-defaults = get_country_defaults(country_code or "PT")
-cA, cB, cC = st.columns(3)
-with cA:
-    st.markdown(f"**Sugestão {country_name or 'País'}** · import: {defaults['import_fee']} €/MWh · export: {defaults['export_fee']} €/MWh")
-with cB:
-    st.markdown(f"**Limites sugeridos** · imp: {defaults['P_imp']} MW · exp: {defaults['P_exp']} MW")
-with cC:
-    if st.button("Aplicar preset do país"):
-        st.session_state.grid_params["import_fee"] = defaults["import_fee"]
-        st.session_state.grid_params["export_fee"] = defaults["export_fee"]
-        st.session_state.grid_params["P_imp"] = defaults["P_imp"]
-        st.session_state.grid_params["P_exp"] = defaults["P_exp"]
+def pv_synth(index_utc: pd.DatetimeIndex, mwp: float, yield_kwh_per_kwp: float) -> pd.DataFrame:
+    """
+    Perfil sintético em 15 s:
+    - forma diária suave (pico ao meio-dia UTC),
+    - fator sazonal por mês,
+    - escalado para bater energia anual alvo: MWp * yield.
+    """
+    idx = pd.DatetimeIndex(pd.to_datetime(index_utc, utc=True))
+    dt_h = (idx[1] - idx[0]).total_seconds() / 3600.0
+    T = len(idx)
 
-# ===========================
-#  TARIFAS / REDE / CUSTOS
-# ===========================
-st.header("Tarifas, rede e custos")
+    # Fatores mensais (genéricos Europa), normalizados depois
+    month_vec = np.array([0.35,0.50,0.70,0.90,1.00,1.05,1.05,1.00,0.80,0.60,0.45,0.35])
+    m = idx.month.values
+    f_month = month_vec[m-1]
 
-colA, colB, colC = st.columns(3)
-with colA:
-    import_fee_const = st.number_input("Tarifa base de importação (€/MWh)", 0.0, value=float(st.session_state.grid_params.get("import_fee", 0.0)), step=1.0)
-    export_fee_const = st.number_input("Tarifa base de exportação (€/MWh)", 0.0, value=float(st.session_state.grid_params.get("export_fee", 0.0)), step=1.0)
-    P_imp = st.number_input("Limite de importação (MW)", 0.0, value=float(st.session_state.grid_params.get("P_imp", 200.0)), step=5.0)
-with colB:
-    P_exp = st.number_input("Limite de exportação (MW)", 0.0, value=float(st.session_state.grid_params.get("P_exp", 200.0)), step=5.0)
-    allow_grid = st.checkbox("Permitir carga pela rede", value=True)
-    solver_time = st.number_input("Tempo máx. solver (s)", 10, value=120, step=10)
-with colC:
-    deg_cost = st.number_input("Degradação (€/MWh descarregado)", 0.0, value=2.0, step=0.5)
-    opex_fix_bess = st.number_input("OPEX fixo BESS (€/ano)", 0.0, value=60_000.0, step=5_000.0)
-    opex_fix_gen  = st.number_input("OPEX fixo usina (€/ano)", 0.0, value=0.0, step=10_000.0)
+    # Forma diária: 0 fora ~6–18 UTC, sino no meio-dia
+    h = idx.hour.values + idx.minute.values/60 + idx.second.values/3600
+    phi = np.pi * (h - 12.0) / 6.0  # 12h=0 ; ±6h = ±π
+    f_day = np.cos(phi)
+    f_day = np.clip(f_day, 0.0, None) ** 1.5  # recorta e suaviza
 
-colD, colE, colF = st.columns(3)
-with colD:
-    opex_var_trade = st.number_input("OPEX var. mercado (€/MWh)", 0.0, value=0.5, step=0.1)
-    opex_var_gen   = st.number_input("OPEX var. geração (€/MWh)", 0.0, value=0.0, step=0.1)
-    capex_gen = st.number_input("CAPEX usina (EUR)", 0.0, value=0.0, step=100_000.0)
-with colE:
-    discount = st.number_input("Taxa de desconto (%)", 0.0, value=8.0, step=0.5)
-    lifetime = st.number_input("Vida útil (anos)", 1, value=15, step=1)
-    eta_c = st.number_input("Eficiência de carga η_charge (%)", 0.0, 100.0, 95.0, step=1.0)
-with colF:
-    eta_d = st.number_input("Eficiência de descarga η_discharge (%)", 0.0, 100.0, 95.0, step=1.0)
-    eta_ac2dc = st.number_input("Eficiência AC→DC (%)", 0.0, 100.0, 98.0, step=0.5)
-    eta_dc2ac = st.number_input("Eficiência DC→AC (%)", 0.0, 100.0, 98.0, step=0.5)
+    base = f_month * f_day
+    if base.max() <= 0:
+        pv_mw = np.zeros(T)
+    else:
+        base = base / base.max()
+        pv_mw = mwp * base
 
-st.subheader("SoC (estado de carga)")
-cS1, cS2, cS3, cS4 = st.columns(4)
-with cS1:
-    soc_min = st.number_input("SoC mínimo (%)", 0.0, 100.0, 0.0, step=5.0)
-with cS2:
-    soc_max = st.number_input("SoC máximo (%)", 0.0, 100.0, 100.0, step=5.0)
-with cS3:
-    soc_init = st.number_input("SoC inicial (%)", 0.0, 100.0, 50.0, step=5.0)
-with cS4:
-    soc_final_min = st.number_input("SoC final mínimo (%)", 0.0, 100.0, 0.0, step=5.0)
-enforce_equal_terminal = st.checkbox("Forçar SoC final = SoC inicial", value=False)
+    # Ajuste de energia anual
+    energy_goal_MWh = mwp * yield_kwh_per_kwp  # 1 MWp ~ 1000 kWp → MWh = MWp * kWh/kWp
+    energy_est_MWh = (pv_mw * dt_h).sum()
+    if energy_est_MWh > 1e-6:
+        scale = energy_goal_MWh / energy_est_MWh
+        pv_mw = np.minimum(mwp, pv_mw * scale)  # limita por MWp
 
-st.subheader("CAPEX BESS (€/kWh e €/kW)")
-cE, cP = st.columns(2)
-with cE:
-    capex_E = st.number_input("CAPEX (€/kWh)", 0.0, value=250.0, step=10.0)
-with cP:
-    capex_P = st.number_input("CAPEX (€/kW)", 0.0, value=150.0, step=10.0)
+    return pd.DataFrame({"datetime": idx, "pv_MW": pv_mw})
 
-# ===========================
-#  TARIFAS TOU
-# ===========================
-st.header("Tarifas por faixa horária (TOU)")
-fee_import_series = np.full(len(price_df), import_fee_const, dtype=float)
-fee_export_series = np.full(len(price_df), export_fee_const, dtype=float)
+pv_df = pv_synth(price_df["datetime"], mwp, yield_kwh_per_kwp)
 
-cT1, cT2 = st.columns(2)
-with cT1:
-    tou_csv = st.file_uploader("CSV TOU (`datetime,import_fee_EUR_per_MWh,export_fee_EUR_per_MWh`)", type=["csv"])
-    if tou_csv:
-        tou = pd.read_csv(tou_csv)
-        tou["datetime"] = pd.to_datetime(tou["datetime"], utc=True)
-        tou = tou.sort_values("datetime").set_index("datetime").resample("15S").ffill().reset_index()
-        merged = pd.merge_asof(price_df[["datetime"]], tou, on="datetime")
-        if "import_fee_EUR_per_MWh" in merged:
-            fee_import_series = merged["import_fee_EUR_per_MWh"].fillna(import_fee_const).to_numpy(float)
-        if "export_fee_EUR_per_MWh" in merged:
-            fee_export_series = merged["export_fee_EUR_per_MWh"].fillna(export_fee_const).to_numpy(float)
+# Plot rápido
+with st.expander("Visualizar PV sintético (amostra)"):
+    show = pv_df.iloc[::max(1, len(pv_df)//2000)]
+    fig, ax = plt.subplots()
+    ax.plot(show["datetime"], show["pv_MW"], lw=0.8)
+    ax.set_title("PV (MW) – amostra")
+    ax.grid(alpha=0.2)
+    st.pyplot(fig)
 
-with cT2:
-    st.markdown("**Modo simples (pico/fora-pico):**")
-    use_simple = st.checkbox("Aplicar modo simples", value=False)
-    if use_simple:
-        peak_start = st.number_input("Pico — início (hora 0-23 UTC)", 0, 23, 18)
-        peak_end   = st.number_input("Pico — fim (hora 0-23 UTC)", 0, 23, 21)
-        peak_imp   = st.number_input("Import pico (€/MWh)", 0.0, value=import_fee_const + 5.0, step=0.5)
-        peak_exp   = st.number_input("Export pico (€/MWh)", 0.0, value=export_fee_const + 0.5, step=0.5)
-        off_imp    = st.number_input("Import fora-pico (€/MWh)", 0.0, value=import_fee_const, step=0.5)
-        off_exp    = st.number_input("Export fora-pico (€/MWh)", 0.0, value=export_fee_const, step=0.5)
-        weekend_offpeak = st.checkbox("Fins-de-semana como fora-pico", value=True)
+# =====================================================
+# 3) BESS (só MWh + C-rate)
+# =====================================================
+st.header("BESS (parâmetros essenciais)")
 
-        dt = pd.to_datetime(price_df["datetime"], utc=True)
-        hours = dt.dt.hour.to_numpy()
-        wday  = dt.dt.weekday.to_numpy()  # 0=segunda ... 6=domingo
-        mask_peak = (hours >= peak_start) & (hours <= peak_end)
-        if weekend_offpeak:
-            mask_peak = mask_peak & (wday < 5)
-        fee_import_series = np.where(mask_peak, peak_imp, off_imp).astype(float)
-        fee_export_series = np.where(mask_peak, peak_exp, off_exp).astype(float)
+cB1, cB2, cB3 = st.columns(3)
+with cB1:
+    e_bess_mwh = st.number_input("Capacidade do BESS (MWh)", 0.0, value=200.0, step=20.0)
+with cB2:
+    c_rate = st.number_input("C-rate (1/h)", 0.05, value=0.5, step=0.05)
+with cB3:
+    round_trip_eff = st.number_input("Eficiência round-trip (%)", 1.0, 100.0, 90.0, 1.0)
 
-# ===========================
-#  PARÂMETROS GERAIS (dict)
-# ===========================
+# dividir round-trip em carga/descarga simétricas
+eta_charge = (round_trip_eff/100.0) ** 0.5
+eta_discharge = eta_charge
+
+st.subheader("SoC")
+s1, s2, s3 = st.columns(3)
+with s1:
+    soc_min = st.number_input("SoC mínimo (%)", 0.0, 100.0, 5.0, 1.0)
+with s2:
+    soc_init = st.number_input("SoC inicial (%)", 0.0, 100.0, 50.0, 1.0)
+with s3:
+    enforce_equal_terminal = st.checkbox("Forçar SoC final = inicial", value=True)
+
+allow_grid = st.checkbox("Permitir carga pela rede (grid charging)", value=True)
+
+# Potência nominal pela combinação E + C
+p_bess_mw = e_bess_mwh * c_rate
+
+# =====================================================
+# 4) REDE – tarifas e limites (constantes)
+# =====================================================
+st.header("Rede (tarifas simples e limites)")
+
+preset = get_country_defaults(code_by_name[country_name])
+
+g1, g2, g3, g4 = st.columns(4)
+with g1:
+    imp_fee = st.number_input("Tarifa de importação (€/MWh)", 0.0, value=float(preset["import_fee"]), step=0.5)
+with g2:
+    exp_fee = st.number_input("Tarifa de exportação (€/MWh)", 0.0, value=float(preset["export_fee"]), step=0.5)
+with g3:
+    p_imp_max = st.number_input("Limite de importação (MW)", 0.0, value=float(preset["P_imp"]), step=10.0)
+with g4:
+    p_exp_max = st.number_input("Limite de exportação (MW)", 0.0, value=float(preset["P_exp"]), step=10.0)
+
+# =====================================================
+# 5) CAPEX & OPEX (defaults bons; editar se quiser)
+# =====================================================
+with st.expander("CAPEX/OPEX (opcional – defaults realistas)"):
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        capex_gen = st.number_input("CAPEX da usina (EUR)", 0.0, value=0.0, step=100_000.0)
+        capex_E = st.number_input("CAPEX BESS (€/kWh)", 0.0, value=250.0, step=10.0)
+    with c2:
+        capex_P = st.number_input("CAPEX BESS (€/kW)", 0.0, value=150.0, step=10.0)
+        opex_fix_bess = st.number_input("OPEX fixo BESS (€/ano)", 0.0, value=60_000.0, step=5_000.0)
+    with c3:
+        opex_fix_gen = st.number_input("OPEX fixo usina (€/ano)", 0.0, value=0.0, step=10_000.0)
+        deg_cost = st.number_input("Degradação (€/MWh throughput)", 0.0, value=2.0, step=0.5)
+
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        discount = st.number_input("Taxa de desconto (%)", 0.0, value=8.0, step=0.5)
+    with d2:
+        lifetime = st.number_input("Vida útil (anos)", 1, value=15, step=1)
+    with d3:
+        solver_time = st.number_input("Tempo máx. solver (s)", 10, value=120, step=10)
+
+# =====================================================
+# 6) Monta parâmetros e roda
+# =====================================================
 params = {
-    "P_grid_import_max": P_imp,
-    "P_grid_export_max": P_exp,
+    "P_grid_import_max": p_imp_max,
+    "P_grid_export_max": p_exp_max,
     "allow_grid_charging": allow_grid,
     "deg_cost_eur_per_MWh_throughput": deg_cost,
     "opex_fix_bess": opex_fix_bess,
     "opex_fix_gen": opex_fix_gen,
-    "opex_var_trade_eur_per_MWh": opex_var_trade,
-    "opex_var_gen_eur_per_mwh": opex_var_gen,
+    "opex_var_trade_eur_per_MWh": 0.5,   # leve custo variável de trading
+    "opex_var_gen_eur_per_mwh": 0.0,
     "discount_rate": discount,
     "lifetime_years": lifetime,
     "c_E_capex": capex_E,
     "c_P_capex": capex_P,
     "capex_gen": capex_gen,
-    "eta_charge": eta_c / 100.0,
-    "eta_discharge": eta_d / 100.0,
-    "eta_ac2dc": eta_ac2dc / 100.0,
-    "eta_dc2ac": eta_dc2ac / 100.0,
-    "soc_min": soc_min / 100.0,
-    "soc_max": soc_max / 100.0,
-    "soc_init": soc_init / 100.0,
-    "soc_final_min": soc_final_min / 100.0,
+    "eta_charge": eta_charge,
+    "eta_discharge": eta_discharge,
+    "eta_ac2dc": 0.985,
+    "eta_dc2ac": 0.985,
+    "soc_min": soc_min/100.0,
+    "soc_max": 1.0,
+    "soc_init": soc_init/100.0,
+    "soc_final_min": soc_init/100.0 if enforce_equal_terminal else 0.0,
     "enforce_terminal_equals_init": enforce_equal_terminal,
     "solver_time_limit_s": solver_time,
-    # séries TOU:
-    "import_fee_series": fee_import_series,
-    "export_fee_series": fee_export_series,
-    # também manter constantes para baseline
-    "import_fee_eur_per_MWh": import_fee_const,
-    "export_fee_eur_per_MWh": export_fee_const,
+    # Tarifas simples (série constante)
+    "import_fee_series": np.full(len(price_df), float(imp_fee)),
+    "export_fee_series": np.full(len(price_df), float(exp_fee)),
+    "import_fee_eur_per_MWh": float(imp_fee),
+    "export_fee_eur_per_MWh": float(exp_fee),
 }
 
-# ===========================
-#  BASELINES
-# ===========================
-st.header("Baselines (referência)")
-base = baselines_mw(price_df, pv_df, load_df,
-                    import_fee_const=import_fee_const,
-                    export_fee_const=export_fee_const,
-                    import_fee_series=fee_import_series,
-                    export_fee_series=fee_export_series)
-b1, b2 = st.columns(2)
-b1.metric("Custo consumo (TOU aplicado)", euro(base["Cost_consumption_annual_EUR"], 0))
-b2.metric("Receita só solar (TOU aplicado)", euro(base["Revenue_solar_only_annual_EUR"], 0))
+# Rodar
+res = run_site_bess_mw(
+    price_df=price_df,
+    pv_df=pv_df,
+    load_df=None,             # sem carga local neste modo simples
+    params=params,
+    P_bess_MW=float(p_bess_mw),
+    c_rate_per_hour=float(c_rate),
+    return_schedule=True
+)
 
-# ===========================
-#  BESS — FIXO / OTIMIZAR
-# ===========================
-st.header("BESS — definir P (MW) e C-rate (1/h)")
-mode = st.radio("Modo", ["Rodar tamanho fixo", "Otimizar (P e C-rate)"], horizontal=True)
+# =====================================================
+# 7) Saídas – faturamento anual e métricas
+# =====================================================
+st.header("Resultados")
 
-if mode == "Rodar tamanho fixo":
-    cc1, cc2 = st.columns(2)
-    with cc1:
-        P_bess = st.number_input("P_bess (MW)", 0.0, value=50.0, step=5.0)
-    with cc2:
-        C_rate = st.number_input("C-rate (1/h)", 0.05, value=0.5, step=0.05)
-    res = run_site_bess_mw(price_df, pv_df, load_df, params, P_bess, C_rate, return_schedule=True)
-else:
-    st.markdown("**Varredura (grade pequena)**")
-    cc1, cc2, cc3 = st.columns(3)
-    with cc1:
-        P_min = st.number_input("P_min (MW)", 0.0, value=20.0, step=5.0)
-        P_max = st.number_input("P_max (MW)", 0.0, value=100.0, step=5.0)
-    with cc2:
-        C_min = st.number_input("C_min (1/h)", 0.05, value=0.33, step=0.01)
-        C_max = st.number_input("C_max (1/h)", 0.05, value=1.0, step=0.01)
-    with cc3:
-        N = st.slider("Pontos por eixo", 2, 6, 3)
-        objective = st.selectbox("Objetivo", ["ROI", "EBITDA"], index=0)
-    P_vals = np.linspace(P_min, P_max, N)
-    C_vals = np.linspace(C_min, C_max, N)
-    res = optimize_site_bess_mw(price_df, pv_df, load_df, params, P_vals, C_vals, objective)
+# “Faturamento anual”: receita de exportação + economia por autoconsumo
+faturamento = float(res["Revenue_export_annual_EUR"] + res["Savings_selfcons_annual_EUR"])
 
-# ===========================
-#  RESULTADOS
-# ===========================
-st.subheader("Resultados")
-r1, r2, r3 = st.columns(3)
-r1.metric("P_bess (MW)", fmt_pt(res["P_cap_MW"], 2))
-r2.metric("E_bess (MWh) = P/C", fmt_pt(res["E_cap_MWh"], 2))
-r3.metric("Throughput (MWh/ano)", fmt_pt(res["Throughput_annual_MWh"], 0))
+m1, m2, m3 = st.columns(3)
+m1.metric("Faturamento anual (€/ano)", euro(faturamento, 0))
+m2.metric("EBITDA (€/ano)", euro(res["EBITDA_project_annual_EUR"], 0))
+m3.metric("ROI anual (%)", fmt_pt(res["ROI_annual_%"], 2))
 
-r4, r5, r6 = st.columns(3)
-r4.metric("Margem bruta (€/ano)", euro(res["Gross_margin_annual_EUR"], 0))
-r5.metric("EBITDA (€/ano)", euro(res["EBITDA_project_annual_EUR"], 0))
-r6.metric("ROI anual (%)", fmt_pt(res["ROI_annual_%"], 2))
-
-r7, r8 = st.columns(2)
-r7.metric("Payback (anos)", fmt_pt(res["Payback_years"], 2))
-r8.metric("LCOE total (€/MWh)", fmt_pt(res["LCOE_total_EUR_per_MWh"], 2))
+m4, m5, m6 = st.columns(3)
+m4.metric("Payback (anos)", fmt_pt(res["Payback_years"], 2))
+m5.metric("Throughput (MWh/ano)", fmt_pt(res["Throughput_annual_MWh"], 0))
+m6.metric("LCOE total (€/MWh)", fmt_pt(res["LCOE_total_EUR_per_MWh"], 2))
 
 st.markdown("**Componentes**")
 k1, k2, k3 = st.columns(3)
-k1.metric("Receita export (€/ano)", euro(res["Revenue_export_annual_EUR"], 0))
-k2.metric("Economia autoconsumo (€/ano)", euro(res["Savings_selfcons_annual_EUR"], 0))
-k3.metric("Custo carga da rede (€/ano)", euro(res["Cost_charge_grid_annual_EUR"], 0))
+k1.metric("Receita de exportação (€/ano)", euro(res["Revenue_export_annual_EUR"], 0))
+k2.metric("Economia por autoconsumo (€/ano)", euro(res["Savings_selfcons_annual_EUR"], 0))
+k3.metric("Custo de carga pela rede (€/ano)", euro(res["Cost_charge_grid_annual_EUR"], 0))
 
-if "schedule" in res:
-    st.subheader("Schedule (amostra)")
-    dfp = res["schedule"].iloc[::max(1, len(res["schedule"]) // 2500)]
-    st.dataframe(dfp.head(400))
+# tabela/schedule (amostra)
+with st.expander("Ver schedule (amostra)"):
+    show = res["schedule"].iloc[::max(1, len(res["schedule"])//2000)]
+    st.dataframe(show.head(400))
+
     fig, ax = plt.subplots()
-    for col in ["pv_MWh","load_MWh","c_grid_MWh","c_pv_MWh","d_grid_MWh","d_load_MWh","pv_load_MWh","pv_exp_MWh","g_load_MWh"]:
-        if col in dfp.columns:
-            ax.plot(dfp["datetime"], dfp[col], label=col, linewidth=0.9)
-    ax.legend(ncol=3); ax.set_title("Fluxos (MWh por passo)"); ax.grid(True, alpha=0.2)
+    for col in ["pv_MWh","c_grid_MWh","c_pv_MWh","d_grid_MWh","d_load_MWh","pv_exp_MWh","pv_load_MWh"]:
+        if col in show.columns:
+            ax.plot(show["datetime"], show[col], label=col, lw=0.8)
+    ax.legend(ncol=3, fontsize=8); ax.grid(alpha=0.2); ax.set_title("Fluxos (MWh por passo)")
     st.pyplot(fig)
 
-# ===========================
-#  PDF
-# ===========================
-st.header("Exportar PDF (resumo)")
+# PDF simples
+st.subheader("Exportar PDF")
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 
-def build_pdf(base, res):
+def build_pdf(res, faturamento):
     buf = io.BytesIO(); c = canvas.Canvas(buf, pagesize=A4); W,H=A4
     c.setFont("Helvetica-Bold", 16)
-    c.drawString(2*cm, H-2.4*cm, "Relatório — Calculadora BESS (MW, TOU, AC/DC, SoC)")
+    c.drawString(2*cm, H-2.4*cm, "Relatório — BESS (modo simples)")
     c.setFont("Helvetica", 10)
     c.drawString(2*cm, H-3.1*cm, f"Gerado em {datetime.utcnow():%Y-%m-%d %H:%M UTC}")
     c.line(2*cm, H-3.3*cm, W-2*cm, H-3.3*cm)
 
-    y = H-4.3*cm; c.setFont("Helvetica-Bold", 12); c.drawString(2*cm, y, "Baselines (TOU)"); y -= 0.55*cm
-    c.setFont("Helvetica", 11)
-    c.drawString(2.2*cm, y, f"• Custo consumo: {euro(base['Cost_consumption_annual_EUR'],0)}"); y -= 0.45*cm
-    c.drawString(2.2*cm, y, f"• Receita só solar: {euro(base['Revenue_solar_only_annual_EUR'],0)}"); y -= 0.8*cm
-
-    c.setFont("Helvetica-Bold", 12); c.drawString(2*cm, y, "BESS (resultado)"); y -= 0.55*cm
-    c.setFont("Helvetica", 11)
-    c.drawString(2.2*cm, y, f"P_bess: {fmt_pt(res['P_cap_MW'],2)} MW  |  E_bess: {fmt_pt(res['E_cap_MWh'],2)} MWh"); y -= 0.45*cm
-    c.drawString(2.2*cm, y, f"Margem bruta: {euro(res['Gross_margin_annual_EUR'],0)}  |  EBITDA: {euro(res['EBITDA_project_annual_EUR'],0)}"); y -= 0.45*cm
-    c.drawString(2.2*cm, y, f"ROI anual: {fmt_pt(res['ROI_annual_%'],2)} %  |  Payback: {fmt_pt(res['Payback_years'],2)} anos"); y -= 0.45*cm
-    c.drawString(2.2*cm, y, f"Receita export: {euro(res['Revenue_export_annual_EUR'],0)}  |  Economia autoconsumo: {euro(res['Savings_selfcons_annual_EUR'],0)}"); y -= 0.45*cm
-    c.drawString(2.2*cm, y, f"Custo carga rede: {euro(res['Cost_charge_grid_annual_EUR'],0)}"); y -= 0.8*cm
-    c.drawString(2*cm, y, f"LCOE total: {fmt_pt(res['LCOE_total_EUR_per_MWh'],2)} €/MWh  |  Throughput: {fmt_pt(res['Throughput_annual_MWh'],0)} MWh/ano")
+    y=H-4.2*cm; c.setFont("Helvetica", 11)
+    c.drawString(2*cm, y, f"Faturamento anual: {euro(faturamento,0)}"); y-=0.45*cm
+    c.drawString(2*cm, y, f"EBITDA: {euro(res['EBITDA_project_annual_EUR'],0)}   ROI: {fmt_pt(res['ROI_annual_%'],2)} %"); y-=0.45*cm
+    c.drawString(2*cm, y, f"Payback: {fmt_pt(res['Payback_years'],2)} anos   LCOE: {fmt_pt(res['LCOE_total_EUR_per_MWh'],2)} €/MWh"); y-=0.45*cm
+    c.drawString(2*cm, y, f"Throughput: {fmt_pt(res['Throughput_annual_MWh'],0)} MWh/ano"); y-=0.8*cm
+    c.drawString(2*cm, y, f"Receita exportação: {euro(res['Revenue_export_annual_EUR'],0)}"); y-=0.45*cm
+    c.drawString(2*cm, y, f"Economia autoconsumo: {euro(res['Savings_selfcons_annual_EUR'],0)}"); y-=0.45*cm
+    c.drawString(2*cm, y, f"Custo carga rede: {euro(res['Cost_charge_grid_annual_EUR'],0)}")
 
     c.showPage(); c.save(); buf.seek(0); return buf
 
-pdf = build_pdf(base, res)
-st.download_button("⬇️ Baixar PDF", data=pdf, file_name="bess_mw_report.pdf", mime="application/pdf")
+pdf = build_pdf(res, faturamento)
+st.download_button("⬇️ Baixar PDF", data=pdf, file_name="bess_modo_simples.pdf", mime="application/pdf")
